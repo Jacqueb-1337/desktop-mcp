@@ -7,13 +7,22 @@ approval from the Windows owner.
 
 ## Windows release
 
-- DesktopMCP-Setup-v0.3.1.exe installs the tray and local agent for a fresh PC.
-  It ships with no gateway configuration or elevated service. The installer is unsigned.
-- DesktopMCP-Tray-v0.3.1.exe is the tray-only update for existing installations.
-  Exit Desktop MCP from the tray menu, back up and replace desktop-mcp.exe in
-  %LOCALAPPDATA%\Programs\DesktopMCP with the downloaded tray executable (rename
-  it to desktop-mcp.exe), then start it again. The agent and gateway run separately.
-- SHA256SUMS.txt lists the hashes of both executables.
+- **DesktopMCP-Setup-v0.3.2.exe** is the complete *fresh-install* Windows package.
+  It includes the tray, local agent, protected unattended SYSTEM service, pinned
+  public gateway trust material, and the signed official WireGuard Windows MSI.
+  The owner enters their gateway's public IP/hostname and approves local UAC
+  elevation before enabling unattended access. The setup EXE itself is unsigned.
+- This release's remote trust material identifies a specific private family
+  gateway. Entering another server's IP will not bypass its pinned identity.
+- **DesktopMCP-Tray-v0.3.2.exe** is a tray-only binary for a manual update.
+  Exit Desktop MCP, back up and replace desktop-mcp.exe in
+  %LOCALAPPDATA%\Programs\DesktopMCP, then start it again.
+  This does **not** upgrade the local agent, protected service, or WireGuard.
+- **Do not run the setup EXE over an existing installation.** In-place updates
+  are not implemented; the installer preserves and refuses to overwrite a
+  current pairing identity. Fresh remote Windows installs and reboots still
+  require end-to-end verification. See docs/GATEWAY-SETUP.md.
+- SHA256SUMS.txt lists the hashes of the downloadable release executables.
 
 The tray checks this repository's latest stable GitHub release at startup and every
 six hours. Check for updates is also available in the tray. Installing an update
