@@ -35,7 +35,8 @@ try{
   (Join-Path $PSScriptRoot 'GatewayEndpoint.cs'),
   (Join-Path $PSScriptRoot 'GatewayPeerIdentity.cs'),
   (Join-Path $PSScriptRoot 'WireGuardProvisioning.cs'),
-  (Join-Path $PSScriptRoot 'WireGuardTunnelInstaller.cs'))
+  (Join-Path $PSScriptRoot 'WireGuardTunnelInstaller.cs'),
+  (Join-Path $PSScriptRoot 'BinaryUpgradeTransaction.cs'))
  & $compiler @options
  if($LASTEXITCODE -ne 0){throw 'Service packaging failed'}
 }finally{

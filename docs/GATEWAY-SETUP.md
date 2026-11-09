@@ -77,8 +77,9 @@ public installer. There is no internet-facing MCP TCP port.
 **Not yet approved for public release:** a fresh Windows install, WireGuard
 tunnel service installation and startup after owner UAC, first external UDP
 connection through the router, and subsequent Windows reboot must be tested.
-The existing setup program still refuses an in-place application update.
-It correctly reuses a saved gateway address without prompting, but a real
-safe in-place updating workflow must be implemented and tested before calling
-upgrades supported. Do not distribute the development release candidate as
-production-ready.
+The published v0.3.2 setup still refuses in-place upgrades. A newer
+transactional updater is implemented on the development branch and is
+documented in [WINDOWS-UPGRADE.md](WINDOWS-UPGRADE.md). Its detected-failure
+rollback and disposable local Windows tests pass. A protected service update,
+reboot, and genuine WAN Windows test are still required before production use.
+Do not distribute a development installer as production-ready.

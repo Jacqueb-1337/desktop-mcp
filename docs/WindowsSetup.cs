@@ -43,6 +43,16 @@ internal static class WindowsSetup
             }
             return;
         }
+        if (args.Length == 2 && args[0] == "--upgrade-unattended")
+        {
+            try { UpgradeUnattendedElevated(args[1]); Environment.ExitCode = 0; }
+            catch (Exception error) {
+                MessageBox.Show(error.Message, "Desktop MCP protected service update",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Environment.ExitCode = 1;
+            }
+            return;
+        }
         if (args.Length != 0) { Environment.ExitCode = 2; return; }
         Application.EnableVisualStyles();
         try
@@ -65,10 +75,43 @@ internal static class WindowsSetup
             {
                 if (!Exists(install) || !Exists(state))
                     throw new InvalidOperationException("Partial Desktop MCP installation detected. No state was changed.");
-                MessageBox.Show("Desktop MCP is already installed. Existing configuration is retained.\n\n" +
-                    "Saved gateway: " + (endpoint == null ? "(not configured)" : endpoint.Display) +
-                    "\n\nUse the installed application's update control to update it. The setup program will not overwrite your pairing identity or tunnel settings.",
-                    "Desktop MCP existing installation", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (MessageBox.Show(
+                    "Upgrade Desktop MCP without changing this PC's pairing, gateway, WireGuard keys, or authorization?\n\n" +
+                    "Saved gateway: " + (endpoint == null ? "(not configured yet)" : endpoint.Display) +
+                    "\n\nThe updater will preserve your configuration and restore old binaries if a step fails.",
+                    "Upgrade Desktop MCP", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                if (endpoint == null)
+                {
+                    endpoint = GatewayEndpoint.Prompt();
+                    if (endpoint == null) return;
+                }
+                bool machineInstalled = File.Exists(Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    "DesktopMCP", "DesktopMCPService.exe"));
+                Action machineUpgrade = machineInstalled ?
+                    (Action)(() => ElevateProtectedService(state, true)) : null;
+                WindowsInPlaceUpgrade.Run(install, state, AgentTask, TrayTask, GatewayTask,
+                    endpoint, machineUpgrade);
+                if (!machineInstalled &&
+                    MessageBox.Show("The local agent and tray are updated.\n\n" +
+                        "Do you also want to install the optional protected Windows service and " +
+                        "WireGuard tunnel for remote unattended access? Windows will request UAC approval.",
+                        "Desktop MCP protected service", MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                {
+                    try { ElevateProtectedService(state, false); }
+                    catch(Exception optionalError)
+                    {
+                        MessageBox.Show("The local upgrade succeeded, but the optional protected " +
+                            "service was not installed. Your existing pairing was retained.\n\n" +
+                            optionalError.Message, "Desktop MCP service setup",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                }
+                MessageBox.Show("Desktop MCP was upgraded. Your existing pairing, gateway and " +
+                    "authorization settings were retained.", "Desktop MCP upgraded",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             endpoint = GatewayEndpoint.Prompt();
@@ -184,6 +227,32 @@ internal static class WindowsSetup
     // embedded SYSTEM service. Never elevate a user-supplied executable.
     static void InstallUnattendedElevated(string sourceState)
     {
+        DeployProtectedServiceElevated(sourceState, false);
+    }
+
+    static void UpgradeUnattendedElevated(string sourceState)
+    {
+        DeployProtectedServiceElevated(sourceState, true);
+    }
+
+    static void ElevateProtectedService(string sourceState, bool upgrade)
+    {
+        var start = new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName,
+            (upgrade ? "--upgrade-unattended " : "--install-unattended ") + Quote(sourceState)) {
+            UseShellExecute=true,Verb="runas"
+        };
+        using(var process=Process.Start(start))
+        {
+            if(process==null)throw new InvalidOperationException("Administrator approval was not started.");
+            process.WaitForExit();
+            if(process.ExitCode!=0)
+                throw new InvalidOperationException("Protected service " + (upgrade ? "upgrade" : "installation") +
+                    " did not finish. Its previous installation is retained where possible.");
+        }
+    }
+
+    static void DeployProtectedServiceElevated(string sourceState, bool upgrade)
+    {
         using (var identity = WindowsIdentity.GetCurrent())
             if (!new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
                 throw new InvalidOperationException("Administrator approval required.");
@@ -214,7 +283,12 @@ internal static class WindowsSetup
                 rule.IdentityReference.Value!="S-1-5-32-544" && rule.IdentityReference.Value!="S-1-5-18" &&
                 (rule.FileSystemRights&dangerous)!=0)
                 throw new InvalidOperationException("Protected Desktop MCP directory is writable by a non-administrator.");
-        OfficialWireGuardInstaller.EnsureInstalled(root);
+        if (upgrade)
+        {
+            string installed = Path.Combine(root,"DesktopMCPService.exe");
+            BinaryUpgradeTransaction.CheckOrdinaryFile(installed);
+        }
+        else OfficialWireGuardInstaller.EnsureInstalled(root);
         string bootstrap=Path.Combine(root,"DesktopMCPServiceBootstrap-"+Guid.NewGuid().ToString("N")+".exe");
         using (var resource=typeof(WindowsSetup).Assembly.GetManifestResourceStream("unattended-service"))
         {
@@ -225,7 +299,7 @@ internal static class WindowsSetup
                 output.Flush(true);
             }
         }
-        var start=new ProcessStartInfo(bootstrap,"--install " + Quote(sourceState)){
+        var start=new ProcessStartInfo(bootstrap,(upgrade ? "--upgrade " : "--install ") + Quote(sourceState)){
             UseShellExecute=false,CreateNoWindow=false
         };
         try {
@@ -446,7 +520,7 @@ internal static class WindowsSetup
         return "\"" + Regex.Replace(path, @"\\+$", match => match.Value + match.Value) + "\"";
     }
 
-    static string WaitForCode(string agent, string dir, string state)
+    internal static string WaitForCode(string agent, string dir, string state)
     {
         var time = Stopwatch.StartNew();
         while (time.Elapsed.TotalSeconds < 25)

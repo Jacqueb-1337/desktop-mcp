@@ -30,8 +30,12 @@ foreach ($name in @('agent','gateway-ca','gateway','gateway-wg-public')) {
 }
 if ($null -eq $protected.GetType('WireGuardTunnelInstaller') -or
     $null -eq $assembly.GetType('OfficialWireGuardInstaller') -or
-    $null -eq $assembly.GetType('GatewayEndpoint'))
-    { throw 'The required WireGuard and gateway provisioning code was not included.' }
+    $null -eq $assembly.GetType('GatewayEndpoint') -or
+    $null -eq $assembly.GetType('BinaryUpgradeTransaction') -or
+    $null -eq $assembly.GetType('WindowsInPlaceUpgrade') -or
+    $null -eq $protected.GetType('BinaryUpgradeTransaction') -or
+    $null -eq $protected.GetType('DesktopService').GetMethod('UpgradeMachine',[Reflection.BindingFlags]'NonPublic,Static'))
+    { throw 'The required WireGuard, gateway, or protected in-place upgrade code was not included.' }
 Write-Output ('COMPONENTS_VERIFIED: '+($names -join ', ') + '; SERVICE: ' + ($nested -join ', '))
 if (-not $ComponentsOnly) {
     throw 'Release blocked: live fresh-install, unattended service restart, cross-network WireGuard handshake, revocation, and upgrade acceptance remain unverified.'
