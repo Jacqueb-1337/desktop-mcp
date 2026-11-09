@@ -5,6 +5,7 @@ use crate::{
     policy::{Decision, HostScope, Intent, PolicyFile},
 };
 use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -25,9 +26,27 @@ pub struct Job {
     pub response: SyncSender<Result<Value, String>>,
     pub canceled: Arc<AtomicBool>,
 }
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Devices {
+    keys: HashMap<String, String>,
+    nicknames: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PairingStore {
+    Current(Devices),
+    Legacy(HashMap<String, String>),
+}
+
+pub fn valid_nickname(name: &str) -> bool {
+    !name.trim().is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control)
+}
+
 pub struct Broker {
     policy: PolicyFile,
-    paired: Mutex<HashMap<String,String>>,
+    paired: Mutex<Devices>,
     pairing_file: PathBuf,
     pub audit: Arc<Mutex<Audit>>,
     hosts: Mutex<HashMap<String, SyncSender<Job>>>,
@@ -36,12 +55,22 @@ impl Broker {
     pub fn new(policy: PolicyFile, audit: Audit, state:&Path) -> Result<Self,String> {
         let pairing_file=state.join("paired-devices.json");
         let paired=match fs::symlink_metadata(&pairing_file) {
-            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>HashMap::new(),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Devices::default(),
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len()<=32_768=>{
-                let records:HashMap<String,String>=serde_json::from_slice(&crate::secure_file(&pairing_file)?)
-                    .map_err(|_|"INVALID_PAIRING_STORE")?;
-                if records.len()>64 || records.iter().any(|(id,key)| setup_key(&format!("DM1-{key}")).is_none_or(|(host,_)|host!=*id)) {
+                let mut records=match serde_json::from_slice(&crate::secure_file(&pairing_file)?).map_err(|_|"INVALID_PAIRING_STORE")? {
+                    PairingStore::Current(records)=>records,
+                    PairingStore::Legacy(keys)=>Devices{keys,nicknames:HashMap::new()},
+                };
+                if records.keys.len()>64 || records.nicknames.len()>128 || records.keys.iter().any(|(id,key)| setup_key(&format!("DM1-{key}")).is_none_or(|(host,_)|host!=*id)) {
                     return Err("INVALID_PAIRING_STORE".into());
+                }
+                records.nicknames.retain(|host,_|
+                    records.keys.contains_key(host) || policy.hosts.iter().any(|scope|&scope.host_id==host));
+                let mut names=std::collections::HashSet::new();
+                for name in records.nicknames.values() {
+                    if !valid_nickname(name) || name.trim()!=name || !names.insert(name.to_lowercase()) {
+                        return Err("INVALID_PAIRING_NICKNAMES".into());
+                    }
                 }
                 records
             },
@@ -84,31 +113,62 @@ impl Broker {
         PolicyFile{version:1,hosts:vec![paired_scope(host)]}.decide(intent,host)
     }
     pub fn paired_key(&self,host:&str)->Option<String> {
-        self.paired.lock().ok()?.get(host).cloned()
+        self.paired.lock().ok()?.keys.get(host).cloned()
     }
     pub fn extend_allowlist(&self,allowed:&mut HashMap<String,String>)->Result<(),String> {
-        for (host,key) in self.paired.lock().map_err(|_|"PAIRING_STORE_UNAVAILABLE")?.iter() {
+        for (host,key) in self.paired.lock().map_err(|_|"PAIRING_STORE_UNAVAILABLE")?.keys.iter() {
             allowed.entry(host.clone()).or_insert_with(||key.clone());
         }
         Ok(())
     }
-    fn pair_device(&self,code:&str)->Result<Value,String> {
+    fn save_devices(&self, devices: &Devices) -> Result<(), String> {
         use std::io::Write;
+        let directory=self.pairing_file.parent().ok_or("PAIRING_STORE_UNAVAILABLE")?;
+        let mut file=tempfile::NamedTempFile::new_in(directory).map_err(|_|"PAIRING_STORE_UNAVAILABLE")?;
+        let bytes=serde_json::to_vec(devices).map_err(|_|"PAIRING_STORE_WRITE_FAILED")?;
+        if bytes.len()>32_768 || devices.nicknames.len()>128 {return Err("PAIRING_STORE_FULL".into());}
+        file.write_all(&bytes).map_err(|_|"PAIRING_STORE_WRITE_FAILED")?;
+        file.flush().and_then(|_|file.as_file().sync_all()).map_err(|_|"PAIRING_STORE_WRITE_FAILED")?;
+        file.persist(&self.pairing_file).map_err(|_|"PAIRING_STORE_WRITE_FAILED")?;
+        Ok(())
+    }
+    fn assign_nickname(devices: &mut Devices, host: &str, nickname: &str) -> Result<(), String> {
+        if !valid_nickname(nickname) { return Err("INVALID_NICKNAME".into()); }
+        let nickname=nickname.trim();
+        let folded=nickname.to_lowercase();
+        if devices.nicknames.iter().any(|(id,name)| id!=host && name.to_lowercase()==folded) {
+            return Err("NICKNAME_ALREADY_IN_USE".into());
+        }
+        devices.nicknames.insert(host.into(),nickname.into());
+        Ok(())
+    }
+    fn pair_device(&self,code:&str,nickname:Option<&str>)->Result<Value,String> {
         let (host,key)=setup_key(code).ok_or("INVALID_DEVICE_CODE")?;
         let mut paired=self.paired.lock().map_err(|_|"PAIRING_STORE_UNAVAILABLE")?;
-        if !paired.contains_key(&host) && !self.policy.hosts.iter().any(|scope|scope.host_id==host) {
-            if paired.len()>=64 {return Err("PAIRING_STORE_FULL".into());}
+        let new=!paired.keys.contains_key(&host) && !self.policy.hosts.iter().any(|scope|scope.host_id==host);
+        if new || nickname.is_some() {
             let mut next=paired.clone();
-            next.insert(host.clone(),key);
-            let directory=self.pairing_file.parent().ok_or("PAIRING_STORE_UNAVAILABLE")?;
-            let mut file=tempfile::NamedTempFile::new_in(directory).map_err(|_|"PAIRING_STORE_UNAVAILABLE")?;
-            serde_json::to_writer(file.as_file_mut(),&next).map_err(|_|"PAIRING_STORE_WRITE_FAILED")?;
-            file.flush().and_then(|_|file.as_file().sync_all()).map_err(|_|"PAIRING_STORE_WRITE_FAILED")?;
-            file.persist(&self.pairing_file).map_err(|_|"PAIRING_STORE_WRITE_FAILED")?;
+            if new {
+                if next.keys.len()>=64 {return Err("PAIRING_STORE_FULL".into());}
+                next.keys.insert(host.clone(),key);
+            }
+            if let Some(name)=nickname {Self::assign_nickname(&mut next,&host,name)?;}
+            self.save_devices(&next)?;
             *paired=next;
         }
         Ok(json!({"host_id":host,"workspace_id":"default","paired":true,
-            "elevated_access_requires_owner_approval":true}))
+            "nickname":paired.nicknames.get(&host),"elevated_access_requires_owner_approval":true}))
+    }
+    fn rename_device(&self,host:&str,nickname:&str)->Result<Value,String> {
+        let mut paired=self.paired.lock().map_err(|_|"PAIRING_STORE_UNAVAILABLE")?;
+        if !paired.keys.contains_key(host) && !self.policy.hosts.iter().any(|scope|scope.host_id==host) {
+            return Err("DEVICE_NOT_PAIRED".into());
+        }
+        let mut next=paired.clone();
+        Self::assign_nickname(&mut next,host,nickname)?;
+        self.save_devices(&next)?;
+        *paired=next;
+        Ok(json!({"host_id":host,"nickname":paired.nicknames.get(host)}))
     }
     pub fn call(
         &self,
@@ -117,15 +177,23 @@ impl Broker {
         alive: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         if tool=="pair_device" {
-            return self.pair_device(args["code"].as_str().ok_or("INVALID_DEVICE_CODE")?);
+            return self.pair_device(args["code"].as_str().ok_or("INVALID_DEVICE_CODE")?,args["nickname"].as_str());
+        }
+        if tool=="rename_device" {
+            return self.rename_device(args["host_id"].as_str().ok_or("HOST_REQUIRED")?,args["nickname"].as_str().ok_or("NICKNAME_REQUIRED")?);
         }
         if tool == "list_projects" {
             let paired=self.paired.lock().map_err(|_|"PAIRING_STORE_UNAVAILABLE")?;
-            let scopes=self.policy.hosts.iter().cloned().chain(paired.keys().filter(|id|
+            let scopes=self.policy.hosts.iter().cloned().chain(paired.keys.keys().filter(|id|
                 !self.policy.hosts.iter().any(|scope|scope.host_id==**id)).map(|id|paired_scope(id)));
             let hosts = self.hosts.lock().map_err(|_| "HOST_REGISTRY_UNAVAILABLE")?;
             return Ok(
-                json!({"projects":scopes.map(|scope|json!({"host_id":scope.host_id,"workspace_id":scope.workspace_id,"tools":scope.tools,"connected":hosts.contains_key(&scope.host_id)})).collect::<Vec<_>>()}),
+                json!({"projects":scopes.map(|scope|{
+                    let mut row=json!({"host_id":scope.host_id,"workspace_id":scope.workspace_id,
+                        "tools":scope.tools,"connected":hosts.contains_key(&scope.host_id)});
+                    if let Some(name)=paired.nicknames.get(&scope.host_id) {row["nickname"]=json!(name);}
+                    row
+                }).collect::<Vec<_>>()}),
             );
         }
         let host = args["host_id"].as_str().ok_or("HOST_REQUIRED")?;
@@ -324,13 +392,19 @@ mod tests {
             target_host_id:host.clone(),workspace_id:"default".into(),tool:tool.into()};
         let broker=open();
         assert_eq!(broker.policy_decision(&intent("admin_command"),&host),Decision::Denied);
-        assert!(broker.pair_device(&format!("DM1-{}","00".repeat(32))).is_err());
-        assert_eq!(broker.pair_device(&code).unwrap()["host_id"],host);
-        assert_eq!(broker.pair_device(&code).unwrap()["paired"],true);
+        assert!(broker.pair_device(&format!("DM1-{}","00".repeat(32)),None).is_err());
+        assert_eq!(broker.pair_device(&code,Some("Dad's PC")).unwrap()["host_id"],host);
+        let other=SigningKey::from_bytes(&[43;32]).verifying_key().to_bytes();
+        let other_code=format!("DM1-{}",hex::encode(other));
+        assert_eq!(broker.pair_device(&other_code,Some("DAD'S PC")).unwrap_err(),"NICKNAME_ALREADY_IN_USE");
+        assert!(broker.paired_key(&crate::host_fingerprint(&other)).is_none());
+        assert_eq!(broker.rename_device(&host,"Workshop PC").unwrap()["nickname"],"Workshop PC");
+        assert_eq!(broker.pair_device(&code,None).unwrap()["paired"],true);
         assert_eq!(broker.policy_decision(&intent("patch_apply"),&host),Decision::Denied);
         drop(broker);
         let reopened=open();
         assert_eq!(reopened.paired_key(&host),Some(hex::encode(public)));
+        assert_eq!(reopened.call("list_projects",&json!({}),&||true).unwrap()["projects"][0]["nickname"],"Workshop PC");
         assert_eq!(reopened.policy_decision(&intent("request_permission"),&host),Decision::RequiresLocalApproval);
         assert_eq!(reopened.policy_decision(&intent("admin_command"),&host),Decision::RequiresLocalApproval);
     }
