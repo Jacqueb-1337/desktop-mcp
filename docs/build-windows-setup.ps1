@@ -48,7 +48,7 @@ try {
         [IO.File]::WriteAllLines($config, [string[]]@($GatewayAddress,$GatewayTlsName))
         $resources += @("/resource:$config,gateway", "/resource:$ca,gateway-ca")
     }
-    & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warnaserror+ /reference:Microsoft.CSharp.dll /reference:System.Web.Extensions.dll "/win32icon:$icon" @resources "/out:$outputPath" $source
+    & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warnaserror+ /reference:Microsoft.CSharp.dll /reference:System.Web.Extensions.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll "/win32icon:$icon" @resources "/out:$outputPath" $source (Join-Path $PSScriptRoot "GatewayEndpoint.cs")
     if ($LASTEXITCODE -ne 0) { throw 'Windows setup build failed.' }
 } finally {
     if ($config) { Remove-Item -LiteralPath $config -Force }

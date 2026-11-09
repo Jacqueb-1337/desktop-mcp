@@ -57,7 +57,23 @@ internal static class WindowsSetup
             Directory.CreateDirectory(programs);
             string install = Path.Combine(programs, "DesktopMCP");
             string state = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "com.jacqueb.desktopmcp");
-            string code = Install(install, state, AgentTask, TrayTask, GatewayTask);
+            // Gateway identity and routing credentials are provisioned separately.
+            // The public UDP endpoint is stored in private per-user state and is
+            // never overwritten during an application upgrade.
+            GatewayEndpoint endpoint = GatewayEndpoint.Load(state);
+            if (Exists(install) || Exists(state))
+            {
+                if (!Exists(install) || !Exists(state))
+                    throw new InvalidOperationException("Partial Desktop MCP installation detected. No state was changed.");
+                MessageBox.Show("Desktop MCP is already installed. Existing configuration is retained.\n\n" +
+                    "Saved gateway: " + (endpoint == null ? "(not configured)" : endpoint.Display) +
+                    "\n\nUse the installed application's update control to update it. The setup program will not overwrite your pairing identity or tunnel settings.",
+                    "Desktop MCP existing installation", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            endpoint = GatewayEndpoint.Prompt();
+            if (endpoint == null) return;
+            string code = Install(install, state, AgentTask, TrayTask, GatewayTask, endpoint);
             // Finish service setup before exposing the code for enrollment.
             // Command authority is granted separately by the owner after pairing.
             if (typeof(WindowsSetup).Assembly.GetManifestResourceStream("unattended-service") != null &&
@@ -85,7 +101,7 @@ internal static class WindowsSetup
         }
     }
 
-    static string Install(string install, string state, string agentTask, string trayTask, string gatewayTask)
+    static string Install(string install, string state, string agentTask, string trayTask, string gatewayTask, GatewayEndpoint endpoint)
     {
         if (Exists(install) || Exists(state))
             throw new InvalidOperationException("Desktop MCP already has files on this PC. This installer only supports a fresh installation.");
@@ -104,6 +120,9 @@ internal static class WindowsSetup
             installCreated = true;
             CreatePrivateDirectory(state, user);
             stateCreated = true;
+            if (endpoint == null)
+                throw new InvalidOperationException("A gateway public IP or hostname is required for first-time remote setup.");
+            endpoint.SaveNew(state);
 
             string agent = Path.Combine(install, "desktop-mcp-agent.exe");
             string tray = Path.Combine(install, "desktop-mcp.exe");
