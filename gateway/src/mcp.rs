@@ -154,6 +154,30 @@ fn admin_command_schema() -> Value {
     value
 }
 
+fn terminal_schema(tool:&str)->Value {
+    let mut value=schema();
+    if matches!(tool,"terminal_run"|"terminal_read"|"terminal_close") {
+        value["properties"]["terminal_id"]=json!({"type":"string","format":"uuid"});
+        value["required"].as_array_mut().unwrap().push(json!("terminal_id"));
+    }
+    if tool=="terminal_run" {
+        value["properties"]["command"]=json!({"type":"string","minLength":1,"maxLength":2000});
+        value["properties"]["timeout_seconds"]=json!({"type":"integer","minimum":1,"maximum":28800,"default":7200});
+        value["required"].as_array_mut().unwrap().push(json!("command"));
+    }
+    if tool=="terminal_read" {
+        value["properties"]["offset"]=json!({"type":"integer","minimum":0});
+    }
+    value
+}
+
+fn command_result_schema() -> Value {
+    let mut value=schema();
+    value["properties"]["run_id"]=json!({"type":"string","format":"uuid","description":"The request_id returned by admin_command."});
+    value["required"].as_array_mut().expect("schema has required fields").push(json!("run_id"));
+    value
+}
+
 fn permission_schema() -> Value {
     let mut value = schema();
     value["properties"]["capability"] = json!({"type":"string","enum":["pairing","git_status","fs_read","use_repository","git_snapshot","patch_prepare","patch_review","patch_status","patch_apply","git_commit_patch","system_volume_status","admin_command"]});
@@ -268,7 +292,7 @@ fn rpc(
             if params.get("cursor").is_some() {
                 return (400, Some(error(&id, -32602, "Invalid cursor")));
             }
-            json!({"resultType":"complete","tools":[{"name":"pair_device","description":"Pair a Windows Desktop MCP installation using the DM1 code shared by its owner. This registers the device identity. Request administrator access separately for the owner to approve.","inputSchema":{"type":"object","properties":{"code":{"type":"string","pattern":"^DM1-[a-f0-9]{64}$"}},"required":["code"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},{"name":"list_projects","description":"List paired desktop hosts and their connection status.","inputSchema":{"type":"object","additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}},{"name":"fs_read","description":"Read at most 16 KiB of UTF-8 text in the allowed project after exact local approval.","inputSchema":read_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}},{"name":"request_permission","description":"Ask the PC owner to approve one named capability for a fixed duration or until revoked. For admin_command on a Windows service installation, the owner approves unattended access once for the requested duration.","inputSchema":permission_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},{"name":"admin_command","description":"Run an exact PowerShell command as administrator on the selected Windows PC. A service installation can run this within an active unattended owner grant. A legacy installation needs approval and UAC for each command. Can modify the PC. Returns bounded output and exit code.","inputSchema":admin_command_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}},{"name":"system_volume_status","description":"Check whether Windows has flagged its system volume for a disk check. Requires a separate local approval and Windows elevation on every call.","inputSchema":schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}},{"name":"use_repository","description":"Select an existing local Git repository, or initialize an ordinary folder as one when initialize=true. Requires approval for the exact path. No files are added or committed.","inputSchema":repository_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true}},{"name":"git_snapshot","description":"Create a locally approved Git snapshot commit of selected existing files; empty paths establish the first empty commit.","inputSchema":snapshot_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}},
+            json!({"resultType":"complete","tools":[{"name":"pair_device","description":"Pair a Windows Desktop MCP installation using the DM1 code shared by its owner. This registers the device identity. Request administrator access separately for the owner to approve.","inputSchema":{"type":"object","properties":{"code":{"type":"string","pattern":"^DM1-[a-f0-9]{64}$"}},"required":["code"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},{"name":"list_projects","description":"List paired desktop hosts and their connection status.","inputSchema":{"type":"object","additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}},{"name":"fs_read","description":"Read at most 16 KiB of UTF-8 text in the allowed project after exact local approval.","inputSchema":read_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}},{"name":"request_permission","description":"Ask the PC owner to approve one named capability for a fixed duration or until revoked. For admin_command on a Windows service installation, the owner approves unattended access once for the requested duration.","inputSchema":permission_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},{"name":"admin_command","description":"Run an exact PowerShell command as administrator on the selected Windows PC. A service installation can run this within an active unattended owner grant. A legacy installation needs approval and UAC for each command. Can modify the PC. Returns bounded output and exit code.","inputSchema":admin_command_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}},{"name":"terminal_open","description":"Open a hidden persistent PowerShell terminal under an active unattended grant. Up to four per PC. If full, use admin_command for short one-shot tasks.","inputSchema":terminal_schema("terminal_open"),"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}},{"name":"terminal_list","description":"List running, idle and recently closed persistent terminals for the current grant.","inputSchema":terminal_schema("terminal_list"),"annotations":{"readOnlyHint":true,"openWorldHint":false}},{"name":"terminal_run","description":"Start a command asynchronously in an idle terminal. Directory and variables persist. Returns a command ID immediately.","inputSchema":terminal_schema("terminal_run"),"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}},{"name":"terminal_read","description":"Read command status and a bounded console output page. Pass next_offset to continue reading new output later.","inputSchema":terminal_schema("terminal_read"),"annotations":{"readOnlyHint":true,"openWorldHint":false}},{"name":"terminal_close","description":"Close a terminal and terminate its process tree. Recent results remain readable.","inputSchema":terminal_schema("terminal_close"),"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":false}},{"name":"admin_command_result","description":"Read a retained one-shot command result by request ID, including exit code and captured output. Requires the same active unattended grant.","inputSchema":command_result_schema(),"annotations":{"readOnlyHint":true,"openWorldHint":false}},{"name":"system_volume_status","description":"Check whether Windows has flagged its system volume for a disk check. Requires a separate local approval and Windows elevation on every call.","inputSchema":schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}},{"name":"use_repository","description":"Select an existing local Git repository, or initialize an ordinary folder as one when initialize=true. Requires approval for the exact path. No files are added or committed.","inputSchema":repository_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true}},{"name":"git_snapshot","description":"Create a locally approved Git snapshot commit of selected existing files; empty paths establish the first empty commit.","inputSchema":snapshot_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}},
 {"name":"patch_prepare","description":"Propose bounded UTF-8 file changes against an expected Git HEAD and file SHA256. Returns a diff; does not write.","inputSchema":patch_prepare_schema(),"annotations":{"readOnlyHint":true,"openWorldHint":false}},
 {"name":"patch_review","description":"Review a prepared patch and its exact diff after local approval.","inputSchema":patch_id_schema(),"annotations":{"readOnlyHint":true,"openWorldHint":false}},
 {"name":"patch_status","description":"Read the current state of a prepared patch after local approval.","inputSchema":patch_id_schema(),"annotations":{"readOnlyHint":true,"openWorldHint":false}},
@@ -278,7 +302,7 @@ fn rpc(
         "tools/call" => {
             if !matches!(
                 params["name"].as_str(),
-                Some("git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "list_projects" | "pair_device" | "request_permission" | "system_volume_status" | "admin_command")
+                Some("git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "list_projects" | "pair_device" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "terminal_open" | "terminal_list" | "terminal_run" | "terminal_read" | "terminal_close")
             ) {
                 return (400, Some(error(&id, -32602, "Unknown tool")));
             }
@@ -294,6 +318,20 @@ fn rpc(
                 let id=args.get("request_id").is_none_or(|v|v.as_str().is_some_and(|s|matches!(uuid::Uuid::parse_str(s),Ok(id) if id.get_version()==Some(uuid::Version::Random) && id.to_string()==s)));
                 let (extra, valid_tool_args) = match tool {
                     "fs_read" => (1, args["path"].as_str().is_some_and(valid_read_path)),
+                    "terminal_open" | "terminal_list" => (0,true),
+                    "terminal_run" | "terminal_read" | "terminal_close" => {
+                        let terminal_id=args["terminal_id"].as_str().is_some_and(|id|matches!(
+                            uuid::Uuid::parse_str(id),Ok(value) if value.get_version()==Some(uuid::Version::Random) && value.to_string()==id));
+                        match tool {
+                            "terminal_run" => (2+usize::from(a.contains_key("timeout_seconds")),terminal_id
+                                && args["command"].as_str().is_some_and(crate::policy::valid_command)
+                                && a.get("timeout_seconds").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=28800).contains(&n)))),
+                            "terminal_read" => (1+usize::from(a.contains_key("offset")),terminal_id
+                                && a.get("offset").is_none_or(Value::is_u64)),
+                            _ => (1,terminal_id),
+                        }
+                    },
+                    "admin_command_result" => (1, args["run_id"].as_str().is_some_and(|id|matches!(uuid::Uuid::parse_str(id), Ok(value) if value.get_version()==Some(uuid::Version::Random) && value.to_string()==id))),
                     "admin_command" => (1, args["command"].as_str().is_some_and(crate::policy::valid_command)),
                     "use_repository" => (2, args["path"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=500 && !s.chars().any(char::is_control)) && args["initialize"].is_boolean()),
                     "git_snapshot" => (2,crate::policy::valid_snapshot_args(&json!({"paths":args["paths"],"message":args["message"]}))),

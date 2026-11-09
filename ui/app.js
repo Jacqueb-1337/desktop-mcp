@@ -26,7 +26,10 @@ function currentView(name) {
   document.querySelectorAll(".view").forEach((view) => {
     view.classList.toggle("active", view.id === name);
   });
-  if (name === "activity") renderHistory();
+  if (name === "activity") {
+    renderHistory();
+    void refresh();
+  }
   if (name === "approvals") void refreshApprovals();
 }
 
@@ -139,6 +142,7 @@ function renderHistory() {
 
 function render(data) {
   snapshot = data;
+  if ($("activity").classList.contains("active")) renderHistory();
   const s = data.settings;
   const alive = localAgent?.running === true;
   const remote = alive && localAgent.policy?.remote_access_enabled === true;

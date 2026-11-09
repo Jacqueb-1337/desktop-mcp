@@ -7,9 +7,9 @@ approval from the Windows owner.
 
 ## Windows release
 
-- DesktopMCP-Setup-v0.2.0.exe installs the tray and local agent for a fresh PC.
+- DesktopMCP-Setup-v0.3.0.exe installs the tray and local agent for a fresh PC.
   It ships with no gateway configuration or elevated service. The installer is unsigned.
-- DesktopMCP-Tray-v0.2.0.exe is the tray-only update for existing installations.
+- DesktopMCP-Tray-v0.3.0.exe is the tray-only update for existing installations.
   Exit Desktop MCP from the tray menu, back up and replace desktop-mcp.exe in
   %LOCALAPPDATA%\Programs\DesktopMCP with the downloaded tray executable (rename
   it to desktop-mcp.exe), then start it again. The agent and gateway run separately.

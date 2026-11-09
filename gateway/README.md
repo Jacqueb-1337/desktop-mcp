@@ -46,3 +46,16 @@ The owner can revoke access from the tray or the Desktop MCP revoke shortcut.
 
 A controller with the MCP bearer token can use active unattended grants.
 Restrict who can access that token and the MCP connection.
+
+## Persistent terminals
+
+Update both the gateway and the Windows service agent to v0.3.0. With an active
+unattended administrator grant, terminal_open opens a hidden PowerShell shell.
+terminal_run returns a command ID immediately. Use terminal_read to inspect
+output and exit status and terminal_list to find running and idle shells.
+Working directory and variables persist in each shell. terminal_close stops
+the shell and its process tree. Idle shells close after 30 minutes.
+
+The four-terminal limit applies to persistent shells. admin_command remains
+available for short tasks, and admin_command_result retrieves its retained result
+by request ID for up to 24 hours under the same active grant.

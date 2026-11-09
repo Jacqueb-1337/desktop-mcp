@@ -303,6 +303,12 @@ internal sealed class DesktopService : ServiceBase
         var serviceAcl=File.GetAccessControl(ServiceExe);
         serviceAcl.AddAccessRule(new FileSystemAccessRule(owner,FileSystemRights.ReadAndExecute,AccessControlType.Allow));
         File.SetAccessControl(ServiceExe,serviceAcl);
+        // The tray can read audit metadata without access to service state or secrets.
+        string audit=Path.Combine(State,"unattended-audit.jsonl");
+        using(File.Open(audit,FileMode.OpenOrCreate,FileAccess.Write,FileShare.Read)) {}
+        var auditAcl=File.GetAccessControl(audit);
+        auditAcl.SetAccessRule(new FileSystemAccessRule(owner,FileSystemRights.Read,AccessControlType.Allow));
+        File.SetAccessControl(audit,auditAcl);
         File.Copy(identity,Path.Combine(State,"pairing-identity.json"),true);
         File.WriteAllText(Path.Combine(State,"remote-readonly.enabled"),"enabled\n");
         using(var gateway=Assembly.GetExecutingAssembly().GetManifestResourceStream("gateway")) {

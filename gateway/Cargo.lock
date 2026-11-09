@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-mcp-gateway"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "hex",

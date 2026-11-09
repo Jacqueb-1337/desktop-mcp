@@ -40,6 +40,7 @@ struct Policy {
     admin_commands_enabled:bool,
     admin_run:Option<elevation::Run>,
     system_run:Option<unattended::Task>,
+    terminals:crate::terminal::Pool,
     system_request:Option<Value>,
     system_command:Option<(Value, uuid::Uuid)>,
     system_mode:bool,
@@ -58,6 +59,7 @@ impl Default for Policy {
             admin_commands_enabled:false,
             admin_run:None,
             system_run:None,
+            terminals:crate::terminal::Pool::default(),
             system_request:None,
             system_command:None,
             system_mode:false,
@@ -250,7 +252,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
         "set_remote_readonly" => {
             let Some(enabled)=value["enabled"].as_bool() else {return json!({"error":"BOOLEAN_REQUIRED"});};
             if enabled && !remote_capable {return json!({"error":"REMOTE_READONLY_NOT_ENABLED_AT_LAUNCH"});}
-            if !enabled {policy.remote_reads_enabled=false;policy.admin_run=None;}
+            if !enabled {policy.remote_reads_enabled=false;policy.admin_run=None;policy.terminals.close_all();}
             if let Err(error)=persist_remote_gate(dir,enabled){return json!({"error":error});}
             if !enabled {if let Err(error)=inbox.clear(){return json!({"error":error});}}
             policy.remote_reads_enabled=enabled;json!({"enabled":enabled})
@@ -296,7 +298,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                         Err(error)=>json!({"error":error}),
                     };
                 }
-                if tool!=elevation::COMMAND {
+                if !matches!(tool,elevation::COMMAND|"admin_command_result") && !crate::terminal::is_tool(tool) {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 }
                 let Some(grant)=unattended::grant_id(dir,host) else {
@@ -313,6 +315,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     Err(error)=>json!({"error":error}),
                 };
             }
+            if tool=="admin_command_result" || crate::terminal::is_tool(tool) {return json!({"error":"LOCAL_PERMISSION_REQUIRED"});}
             if elevation::is_privileged(capability) && !policy.privileged_enabled(capability) {
                 return json!({"error":"ADMIN_HELPER_UNAVAILABLE"});
             }
@@ -401,6 +404,24 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 policy.system_command=None;
                 if unattended::grant_id(dir,&host_id)!=Some(grant) {
                     return rejected("UNATTENDED_GRANT_INACTIVE".into());
+                }
+                if crate::terminal::is_tool(tool) {
+                    return match inbox.consume(frame).and_then(|spent| {
+                        if !spent {return Err("LOCAL_APPROVAL_REQUIRED".into());}
+                        policy.terminals.call(dir,&host_id,grant,tool,&frame["arguments"])
+                    }) {
+                        Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
+                        Err(error)=>rejected(error),
+                    };
+                }
+                if tool=="admin_command_result" {
+                    return match inbox.consume(frame).and_then(|spent| {
+                        if !spent {return Err("LOCAL_APPROVAL_REQUIRED".into());}
+                        unattended::command_result(dir,grant,&frame["arguments"]["run_id"])
+                    }) {
+                        Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
+                        Err(error)=>rejected(error),
+                    };
                 }
                 return match inbox.consume(frame).and_then(|spent| {
                     if !spent {return Err("LOCAL_APPROVAL_REQUIRED".into());}
@@ -562,6 +583,7 @@ pub fn serve(agent: &mut Agent, dir: &Path, writes_enabled: bool, remote_capable
     let lock=OpenOptions::new().read(true).write(true).create(true).open(lock_path)
         .map_err(|e|e.to_string())?;
     lock.try_lock().map_err(|_|"LOCAL_AGENT_ALREADY_RUNNING".to_string())?;
+    if system_mode {crate::terminal::start_cleanup(dir)?;}
     let listener=TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST),0))
         .map_err(|e|format!("LOCAL_BIND_ERROR: {e}"))?;
     let port=listener.local_addr().map_err(|e|e.to_string())?.port();

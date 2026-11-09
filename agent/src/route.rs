@@ -78,13 +78,17 @@ pub fn deny(frame: &Value, own_host_id: &str) -> Result<Value, String> {
         || frame.get("target_host_id")!=Some(&json!(own_host_id))
         || frame.get("workspace_id")!=Some(&json!("default"))
         || !(matches!(frame["tool"].as_str(),Some("fs_read"|"git_status"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"))
-            || (executable && matches!(frame["tool"].as_str(), Some("request_permission" | crate::elevation::TOOL | crate::elevation::COMMAND)))) {
+            || (executable && matches!(frame["tool"].as_str(), Some("request_permission" | "admin_command_result" | crate::elevation::TOOL | crate::elevation::COMMAND))) || (executable && frame["tool"].as_str().is_some_and(crate::terminal::is_tool))) {
         return Err("ROUTE_NOT_PERMITTED".into());
     }
     if executable {
         let args = &frame["arguments"];
         let valid = match frame["tool"].as_str() {
             Some("git_status" | crate::elevation::TOOL) => args == &json!({}),
+            Some("admin_command_result") => args.as_object().is_some_and(|a| {
+                a.len() == 1 && args["run_id"].as_str().is_some_and(|id|
+                    matches!(Uuid::parse_str(id), Ok(uuid) if uuid.get_version()==Some(Version::Random) && uuid.to_string()==id))
+            }),
             Some(crate::elevation::COMMAND) => args.as_object().is_some_and(|a| {
                 a.len() == 1 && args["command"].as_str().is_some_and(crate::elevation::valid_command)
             }),
@@ -99,6 +103,7 @@ pub fn deny(frame: &Value, own_host_id: &str) -> Result<Value, String> {
                     && matches!(args["capability"].as_str(), Some("pairing" | "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | crate::elevation::TOOL | crate::elevation::COMMAND))
                     && args["duration"].as_str().and_then(permission_duration).is_some()
             }),
+            Some(tool) if crate::terminal::is_tool(tool) => crate::terminal::valid_args(tool,args),
             _ => false,
         };
         if !valid || frame["expires_at"].as_u64().is_none() {

@@ -70,6 +70,12 @@ impl Broker {
         }
     }
     pub fn policy_decision(&self, intent: &Intent, host: &str) -> Decision {
+        let mut mapped;
+        let intent=if intent.tool=="admin_command_result" || terminal_tool(&intent.tool) {
+            mapped=intent.clone();
+            mapped.tool="admin_command".into();
+            &mapped
+        } else {intent};
         let decision=self.policy.decide(intent,host);
         if decision==Decision::RequiresLocalApproval || self.policy.hosts.iter().any(|scope|scope.host_id==host) {
             return decision;
@@ -133,7 +139,7 @@ impl Broker {
             workspace_id: "default".into(),
             tool: tool.into(),
         };
-        if !matches!(tool, "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command")
+        if !matches!(tool, "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result") && !terminal_tool(tool)
             || self.policy_decision(&intent, host) != Decision::RequiresLocalApproval
         {
             return Err("POLICY_DENIED".into());
@@ -178,6 +184,14 @@ impl Broker {
             "patch_review"|"patch_status"|"patch_apply" => json!({"patch_id":args["patch_id"]}),
             "git_commit_patch" => json!({"patch_id":args["patch_id"],"message":args["message"]}),
             "admin_command" => json!({"command":args["command"]}),
+            "admin_command_result" => json!({"run_id":args["run_id"]}),
+            tool if terminal_tool(tool) => {
+                let mut payload=args.clone();
+                if let Some(fields)=payload.as_object_mut() {
+                    for key in ["host_id","workspace_id","request_id"] {fields.remove(key);}
+                }
+                payload
+            },
             "request_permission" => json!({"capability":args["capability"],"duration":args["duration"]}),
             _ => json!({}),
         };
@@ -206,6 +220,10 @@ impl Broker {
         result
     }
 }
+pub fn terminal_tool(tool:&str)->bool {
+    matches!(tool,"terminal_open"|"terminal_list"|"terminal_run"|"terminal_read"|"terminal_close")
+}
+
 fn paired_scope(host:&str)->HostScope {
     HostScope{host_id:host.into(),workspace_id:"default".into(),
         tools:vec!["request_permission".into(),"admin_command".into()]}

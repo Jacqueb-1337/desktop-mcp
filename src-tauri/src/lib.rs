@@ -91,7 +91,56 @@ fn host_name() -> String {
         .unwrap_or_else(|| "This computer".into())
 }
 
+#[cfg(windows)]
+fn service_history() -> Vec<Activity> {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
+    const MAX_TAIL: u64 = 64 * 1024;
+    let Some(root) = env::var_os("ProgramData") else { return Vec::new(); };
+    let path = PathBuf::from(root).join("DesktopMCP").join("State").join("unattended-audit.jsonl");
+    let Ok(mut file) = fs::File::open(path) else { return Vec::new(); };
+    let Ok(metadata) = file.metadata() else { return Vec::new(); };
+    let offset = metadata.len().saturating_sub(MAX_TAIL);
+    if file.seek(SeekFrom::Start(offset)).is_err() { return Vec::new(); }
+    let mut tail = BufReader::new(file.take(MAX_TAIL));
+    if offset != 0 {
+        // The first record can be incomplete when reading a bounded tail.
+        let _ = tail.read_until(b'\n', &mut Vec::new());
+    }
+    let mut records = Vec::new();
+    for line in tail.lines().map_while(Result::ok) {
+        if let Ok(event) = serde_json::from_str::<Value>(&line) { records.push(event); }
+    }
+    let mut seen = HashSet::new();
+    records.into_iter().rev().filter_map(|event| {
+        let timestamp = event["at"].as_u64()?;
+        let request = event["request_id"].as_str()?;
+        let description = match event["tool"].as_str()? {
+            "request_permission" if event["result_error"] == "owner_approved" => {
+                "Approved unattended administrator access".into()
+            }
+            "admin_command" if event["executed"] == true => {
+                let exit_code = event["exit_code"].as_i64()?;
+                format!("Elevated PowerShell finished (exit {exit_code})")
+            }
+            "admin_command" if event["result_error"] == "started" => {
+                "Elevated PowerShell started".into()
+            }
+            "admin_command" if event["result_error"].is_string() => {
+                "Elevated PowerShell canceled or failed".into()
+            }
+            _ => return None,
+        };
+        seen.insert(request.to_owned()).then_some(Activity { timestamp, description })
+    }).take(40).collect()
+}
+
 fn snapshot(data: &Persisted) -> Snapshot {
+    let mut history: Vec<_> = data.history.iter().rev().take(40).cloned().collect();
+    #[cfg(windows)]
+    history.extend(service_history());
+    history.sort_by_key(|record| std::cmp::Reverse(record.timestamp));
+    history.truncate(40);
     Snapshot {
         host_name: host_name(),
         platform: if cfg!(windows) { "Windows" } else { "Linux" }.into(),
@@ -99,7 +148,7 @@ fn snapshot(data: &Persisted) -> Snapshot {
         pairing_available: true,
         elevation_available: false,
         settings: data.settings.clone(),
-        history: data.history.iter().rev().take(40).cloned().collect(),
+        history,
     }
 }
 

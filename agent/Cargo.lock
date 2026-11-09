@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-mcp-agent"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cap-std",
  "ed25519-dalek",
@@ -163,6 +163,7 @@ dependencies = [
  "similar",
  "tempfile",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -772,6 +773,7 @@ checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

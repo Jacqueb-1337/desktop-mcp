@@ -6,7 +6,7 @@ use std::{path::Path,fs, time::{SystemTime,UNIX_EPOCH,Duration,Instant},process:
 use uuid::Uuid;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-fn epoch()->u64 {
+pub(crate) fn epoch()->u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0,|v|v.as_secs())
 }
 
@@ -62,7 +62,7 @@ fn read_record(path:&Path)->Option<Value> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-fn write_record(path:&Path,value:&Value)->Result<(),String> {
+pub(crate) fn write_record(path:&Path,value:&Value)->Result<(),String> {
     let temporary=path.with_extension(format!("{}.tmp",Uuid::new_v4()));
     let result=(|| {
         let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
@@ -145,6 +145,49 @@ fn audit_record(state:&Path,frame:&Value,outcome:&Value)->Result<(),String>{
         .map_err(|_|"AUDIT_WRITE_FAILED".into())
 }
 
+const RESULT_LIMIT: usize = 64;
+const RESULT_RETENTION: u64 = 24 * 60 * 60;
+static RESULTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn load_results(path: &Path) -> Result<Vec<Value>, String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err("COMMAND_HISTORY_UNAVAILABLE".into()),
+    };
+    let mut bytes = Vec::new();
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)
+        .map_err(|_| "COMMAND_HISTORY_UNAVAILABLE")?;
+    if bytes.len() as u64 > MAX_BYTES { return Err("COMMAND_HISTORY_TOO_LARGE".into()); }
+    let mut records: Vec<Value> =
+        serde_json::from_slice(&bytes).map_err(|_| "COMMAND_HISTORY_INVALID")?;
+    let now = epoch();
+    records.retain(|record| record["finished_at"].as_u64()
+        .is_some_and(|at| at <= now && now - at < RESULT_RETENTION));
+    Ok(records)
+}
+
+fn remember_result(state: &Path, frame: &Value, grant: Uuid, outcome: &Value) -> Result<(), String> {
+    let _guard = RESULTS_LOCK.lock().map_err(|_| "COMMAND_HISTORY_UNAVAILABLE")?;
+    let path = state.join("command-results.json");
+    let mut records = load_results(&path)?;
+    records.insert(0, json!({"run_id":frame["request_id"], "grant_id":grant.to_string(),
+        "finished_at":epoch(), "outcome":outcome}));
+    records.truncate(RESULT_LIMIT);
+    write_record(&path, &json!(records))
+}
+
+pub fn command_result(state: &Path, grant: Uuid, run_id: &Value) -> Result<Value, String> {
+    let _guard = RESULTS_LOCK.lock().map_err(|_| "COMMAND_HISTORY_UNAVAILABLE")?;
+    let grant = grant.to_string();
+    let mut record = load_results(&state.join("command-results.json"))?.into_iter()
+        .find(|record| &record["run_id"] == run_id && record["grant_id"] == grant)
+        .ok_or("COMMAND_RESULT_NOT_FOUND_OR_EXPIRED")?;
+    record.as_object_mut().ok_or("COMMAND_HISTORY_INVALID")?.remove("grant_id");
+    Ok(record)
+}
+
 #[derive(Debug)]
 pub struct Task {
     frame:Value,
@@ -174,6 +217,9 @@ impl Task {
             let mut record=result.clone();
             record["grant_id"]=json!(grant.to_string());
             audit(&state,&frame_copy,&record);
+            if let Err(error) = remember_result(&state, &frame_copy, grant, &result) {
+                eprintln!("Command result was not retained: {error}");
+            }
             let _=sender.send(result);
         }).map_err(|_|"SYSTEM_COMMAND_WORKER_UNAVAILABLE")?;
         Ok(Self{frame:frame.clone(),receiver,canceled})
@@ -228,10 +274,10 @@ fn run(command:&str,state:&Path,host:&str,expires:u64,grant:Uuid,canceled:&Atomi
             }
             match child.try_wait(){
                 Ok(Some(status))=>{
-                    let out=out.join().unwrap_or_default();
-                    let err=err.join().unwrap_or_default();
+                    let (out, out_truncated)=out.join().unwrap_or_default();
+                    let (err, err_truncated)=err.join().unwrap_or_default();
                     return json!({"pending":false,"executed":true,"data":{"exit_code":status.code().unwrap_or(-1),
-                        "stdout":out,"stderr":err,"truncated":false}});
+                        "stdout":out,"stderr":err,"truncated":out_truncated || err_truncated}});
                 }
                 Ok(None)=>thread::sleep(Duration::from_millis(100)),
                 Err(_)=>{let _=child.kill();let _=child.wait();return json!({"pending":false,"executed":false,"error":"SHELL_EXIT_FAILED"});}
@@ -242,16 +288,19 @@ fn run(command:&str,state:&Path,host:&str,expires:u64,grant:Uuid,canceled:&Atomi
     {let _=(command,state,host,expires);json!({"pending":false,"executed":false,"error":"WINDOWS_ONLY"})}
 }
 
-fn capture(mut stream:impl Read)->String{
+fn capture(mut stream:impl Read)->(String, bool){
+    let mut truncated = false;
     let mut output=Vec::new();
     let mut buf=[0u8;2048];
     while let Ok(n)=stream.read(&mut buf) {
         if n==0 {break;}
-        if output.len()<6000 {output.extend_from_slice(&buf[..n.min(6000-output.len())]);}
+        let keep = n.min(6000 - output.len());
+        truncated |= keep < n;
+        output.extend_from_slice(&buf[..keep]);
     }
-    String::from_utf8_lossy(&output).into_owned()
+    (String::from_utf8_lossy(&output).into_owned(), truncated)
 }
-fn base64_encode(data:&[u8])->String {
+pub(crate) fn base64_encode(data:&[u8])->String {
     const TABLE:&[u8]=b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s=String::with_capacity(data.len().div_ceil(3)*4);
     for bytes in data.chunks(3){
@@ -266,6 +315,39 @@ fn base64_encode(data:&[u8])->String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_result_retention_is_bounded_and_grant_scoped() {
+        let state = tempfile::tempdir().unwrap();
+        let grant = Uuid::new_v4();
+        let outcome = json!({"executed":true,"data":{"exit_code":7,"stdout":"partial copy"}});
+        let expired = json!(Uuid::new_v4().to_string());
+        write_record(&state.path().join("command-results.json"), &json!([{
+            "run_id":expired,"grant_id":grant.to_string(),
+            "finished_at":epoch()-RESULT_RETENTION,"outcome":outcome
+        }])).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..=RESULT_LIMIT {
+            let id = json!(Uuid::new_v4().to_string());
+            remember_result(state.path(), &json!({"request_id":id}), grant, &outcome).unwrap();
+            ids.push(id);
+        }
+        let latest = ids.last().unwrap();
+        let record = command_result(state.path(), grant, latest).unwrap();
+        assert_eq!(record["outcome"], outcome);
+        assert!(record.get("grant_id").is_none());
+        assert!(command_result(state.path(), Uuid::new_v4(), latest).is_err());
+        assert!(command_result(state.path(), grant, &ids[0]).is_err());
+        assert!(command_result(state.path(), grant, &expired).is_err());
+    }
+
+    #[test]
+    fn captured_output_reports_truncation() {
+        assert_eq!(capture(&b"abc"[..]), ("abc".into(), false));
+        let (out, truncated) = capture(&vec![b'a'; 6001][..]);
+        assert_eq!(out.len(), 6000);
+        assert!(truncated);
+    }
     #[test]fn base64_is_correct(){
         assert_eq!(base64_encode(b""),"");
         assert_eq!(base64_encode(b"f"),"Zg==");

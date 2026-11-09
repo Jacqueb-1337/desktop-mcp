@@ -9,6 +9,7 @@ mod route;
 mod readonly;
 mod windows_acl;
 mod unattended;
+mod terminal;
 mod approval;
 
 use core::Agent;
