@@ -18,10 +18,13 @@ approval from the Windows owner.
   Exit Desktop MCP, back up and replace desktop-mcp.exe in
   %LOCALAPPDATA%\Programs\DesktopMCP, then start it again.
   This does **not** upgrade the local agent, protected service, or WireGuard.
-- **Do not run the setup EXE over an existing installation.** In-place updates
-  are not implemented; the installer preserves and refuses to overwrite a
-  current pairing identity. Fresh remote Windows installs and reboots still
-  require end-to-end verification. See docs/GATEWAY-SETUP.md.
+- **Do not run the published v0.3.2 setup EXE over an existing installation.**
+  That release only supports fresh installs. The newer development branch
+  implements transactional in-place upgrades and UAC-approved protected-service
+  updates, preserving the pairing identity and existing tunnel settings.
+  See docs/WINDOWS-UPGRADE.md for tests and outstanding acceptance work.
+  Fresh remote Windows installs and reboots still require end-to-end
+  verification. See docs/GATEWAY-SETUP.md.
 - SHA256SUMS.txt lists the hashes of the downloadable release executables.
 
 The tray checks this repository's latest stable GitHub release at startup and every

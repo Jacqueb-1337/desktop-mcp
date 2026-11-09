@@ -351,6 +351,159 @@ internal sealed class DesktopService : ServiceBase
             +"After pairing, ChatGPT can request unattended administrator access for you to approve.",
             "Desktop MCP Service",MessageBoxButtons.OK,MessageBoxIcon.Information);
     }
+    // UAC-approved in-place upgrade. Machine state and existing grants are never copied
+    // from a user folder or rewritten. Only two binaries are permitted to change.
+    private static void UpgradeMachine(string userState)
+    {
+        RequireAdministrator();
+        if(!Directory.Exists(userState) ||
+           !String.Equals(Path.GetFileName(userState.TrimEnd('\\')),
+               "com.jacqueb.desktopmcp",StringComparison.Ordinal) ||
+           (File.GetAttributes(userState)&FileAttributes.ReparsePoint)!=0)
+            throw new InvalidDataException("Original user state directory is missing or redirected.");
+        if(!ServiceExists())throw new InvalidOperationException("Protected Desktop MCP service is not installed.");
+        PrivateDirectory(DataRoot);
+        PrivateDirectory(State);
+        PrivateDirectory(InstallRoot);
+        BinaryUpgradeTransaction.CheckOrdinaryFile(ServiceExe);
+        BinaryUpgradeTransaction.CheckOrdinaryFile(Agent);
+        BinaryUpgradeTransaction.CheckOrdinaryFile(Ca);
+        string identityFile=Path.Combine(State,"pairing-identity.json");
+        string userIdentity=Path.Combine(userState,"pairing-identity.json");
+        BinaryUpgradeTransaction.CheckOrdinaryFile(identityFile);
+        BinaryUpgradeTransaction.CheckOrdinaryFile(userIdentity);
+        string ownerSid=Directory.GetAccessControl(userState)
+            .GetOwner(typeof(SecurityIdentifier)).ToString();
+        var json=new JavaScriptSerializer();
+        var config=json.Deserialize<Dictionary<string,string>>(File.ReadAllText(Path.Combine(DataRoot,"gateway.json")));
+        if(config==null || !config.ContainsKey("ownerSid") ||
+           config["ownerSid"]!=ownerSid)
+            throw new UnauthorizedAccessException("The protected service belongs to a different Windows owner.");
+        string machineKey=ReadPairingPrivateKey(identityFile);
+        if(!String.Equals(machineKey,ReadPairingPrivateKey(userIdentity),StringComparison.Ordinal))
+            throw new InvalidDataException("User identity does not match the installed machine service.");
+        string hostFile=Path.Combine(DataRoot,"host-id.txt");
+        BinaryUpgradeTransaction.CheckOrdinaryFile(hostFile);
+        string expectedHost=File.ReadAllText(hostFile).Trim();
+        if(!String.Equals(expectedHost,GetHostIdentity(),StringComparison.Ordinal))
+            throw new InvalidDataException("Existing machine identity is inconsistent.");
+
+        // Trust cannot change silently during an application update.
+        byte[] caBytes=ReadEmbeddedResource("gateway-ca");
+        if(!EqualBytes(Hash(caBytes),Hash(File.ReadAllBytes(Ca))))
+            throw new InvalidDataException("Gateway TLS CA differs. Reprovision trust explicitly.");
+        using(var cfg=Assembly.GetExecutingAssembly().GetManifestResourceStream("gateway"))
+        using(var reader=new StreamReader(cfg))
+            if(reader.ReadLine()!=config["address"] || reader.ReadLine()!=config["tlsName"])
+                throw new InvalidDataException("Gateway TLS address differs. Refusing silent redirection.");
+        string trustedKey=WireGuardTunnelInstaller.EmbeddedGatewayPublicKey();
+        // WireGuard for Windows can protect and relocate tunnel configurations after
+        // installation. Compare the PUBLIC key inside the previously installed,
+        // administrator-protected service, rather than assuming the original .conf
+        // is still available. Do not open or re-create private tunnel keys.
+        if(!String.Equals(ReadInstalledGatewayPublicKey(),trustedKey,StringComparison.Ordinal))
+            throw new InvalidDataException("Pinned WireGuard server identity differs. Reprovision manually.");
+        string tunnel=Path.Combine(DataRoot,"WireGuard",WireGuardProvisioning.ConfigName);
+        if(File.Exists(tunnel))
+        {
+            BinaryUpgradeTransaction.CheckOrdinaryFile(tunnel);
+            if(!File.ReadAllText(tunnel).Contains("PublicKey = "+trustedKey))
+                throw new InvalidDataException("Installed WireGuard configuration has a different server key.");
+        }
+        else if(!WireGuardTunnelInstaller.TunnelServiceExists())
+            throw new InvalidDataException("Existing WireGuard tunnel service is missing.");
+
+        using(var service=new ServiceController(Name))
+        {
+            service.Refresh();
+            if(service.Status!=ServiceControllerStatus.Running)
+                throw new InvalidOperationException("Service is not running. Start it before upgrading.");
+            var tx=new BinaryUpgradeTransaction(InstallRoot);
+            try
+            {
+                tx.Stage(Path.GetFileName(Agent),ReadEmbeddedResource("agent"),false);
+                tx.Stage(Path.GetFileName(ServiceExe),File.ReadAllBytes(Assembly.GetExecutingAssembly().Location),false);
+                service.Stop();
+                service.WaitForStatus(ServiceControllerStatus.Stopped,TimeSpan.FromSeconds(20));
+                tx.Apply();
+                service.Start();
+                service.WaitForStatus(ServiceControllerStatus.Running,TimeSpan.FromSeconds(20));
+                Thread.Sleep(900);
+                if(!String.Equals(expectedHost,GetHostIdentity(),StringComparison.Ordinal) ||
+                   machineKey!=ReadPairingPrivateKey(identityFile))
+                    throw new InvalidDataException("Machine signing identity changed during upgrade.");
+                tx.Commit();
+            }
+            catch(Exception failure)
+            {
+                try
+                {
+                    service.Refresh();
+                    if(service.Status!=ServiceControllerStatus.Stopped)
+                    {
+                        service.Stop();
+                        service.WaitForStatus(ServiceControllerStatus.Stopped,TimeSpan.FromSeconds(20));
+                    }
+                    tx.Rollback();
+                    service.Start();
+                    service.WaitForStatus(ServiceControllerStatus.Running,TimeSpan.FromSeconds(20));
+                }
+                catch(Exception rollback)
+                {
+                    throw new InvalidOperationException("Protected update failed and rollback needs attention. " +
+                        "Backups: "+tx.BackupDirectory+"; cause: "+failure.GetType().Name+
+                        "; rollback: "+rollback.Message);
+                }
+                throw new InvalidOperationException("Protected service was restored after an update failure. "+
+                    failure.Message,failure);
+            }
+        }
+    }
+
+    private static string ReadInstalledGatewayPublicKey()
+    {
+        BinaryUpgradeTransaction.CheckOrdinaryFile(ServiceExe);
+        var previous=Assembly.Load(File.ReadAllBytes(ServiceExe));
+        using(var stream=previous.GetManifestResourceStream("gateway-wg-public"))
+        {
+            if(stream==null || stream.Length<1 || stream.Length>200)
+                throw new InvalidDataException("Installed service has no verifiable WireGuard public identity.");
+            using(var reader=new StreamReader(stream))
+                return WireGuardProvisioning.ValidateKey(reader.ReadToEnd().Trim());
+        }
+    }
+
+    private static string ReadPairingPrivateKey(string path)
+    {
+        if(new FileInfo(path).Length>131072)throw new InvalidDataException("Invalid pairing identity.");
+        var stored=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(path));
+        if(stored==null || Convert.ToInt32(stored["version"])!=1 ||
+           !(stored["private_key"] is string) ||
+           !System.Text.RegularExpressions.Regex.IsMatch((string)stored["private_key"],@"\A[a-f0-9]{64}\z"))
+            throw new InvalidDataException("Invalid pairing identity.");
+        return (string)stored["private_key"];
+    }
+    private static byte[] ReadEmbeddedResource(string resource)
+    {
+        using(var stream=Assembly.GetExecutingAssembly().GetManifestResourceStream(resource))
+        {
+            if(stream==null || stream.Length<1 || stream.Length>67108864)
+                throw new InvalidDataException("Embedded protected service component missing.");
+            using(var memory=new MemoryStream()){stream.CopyTo(memory);return memory.ToArray();}
+        }
+    }
+    private static byte[] Hash(byte[] raw)
+    {
+        using(var hash=SHA256.Create())return hash.ComputeHash(raw);
+    }
+    private static bool EqualBytes(byte[] a,byte[] b)
+    {
+        if(a.Length!=b.Length)return false;
+        int diff=0;
+        for(int i=0;i<a.Length;i++)diff|=a[i]^b[i];
+        return diff==0;
+    }
+
     private static void CreateOwnerShortcuts()
     {
         string desktop=Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
@@ -470,7 +623,7 @@ internal sealed class DesktopService : ServiceBase
             return;
         }
         if(args.Length==1 && args[0]=="--self-test"){
-            foreach(var required in new[]{"agent","gateway-ca","gateway"}){
+            foreach(var required in new[]{"agent","gateway-ca","gateway","gateway-wg-public"}){
                 using(var stream=Assembly.GetExecutingAssembly().GetManifestResourceStream(required)){
                     if(stream==null || stream.Length==0){Environment.ExitCode=5;return;}
                 }
@@ -481,6 +634,7 @@ internal sealed class DesktopService : ServiceBase
         Application.EnableVisualStyles();
         try{
             if(args.Length==2 && args[0]=="--install"){InstallMachine(args[1]);return;}
+            if(args.Length==2 && args[0]=="--upgrade"){UpgradeMachine(args[1]);return;}
             if(args.Length==1 && args[0]=="--grant"){GrantAccess();return;}
             if(args.Length==1 && args[0]=="--revoke"){RevokeAccess();return;}
             throw new ArgumentException("Usage: --install <pairing state>, --grant, or --revoke.");
