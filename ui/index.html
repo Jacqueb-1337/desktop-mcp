@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Desktop MCP</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <main class="panel" aria-label="Desktop MCP system tray settings">
+    <section id="overview" class="view active" aria-label="Settings">
+      <header class="header">
+        <div class="identity">
+          <svg class="icon icon-monitor" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4.5" width="18" height="13" rx="2"></rect><path d="M9 21h6M12 17.5V21"></path></svg>
+          <div>
+            <h1>Desktop MCP</h1>
+            <p class="connection"><svg id="connection-icon" class="connection-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="m8 12 3 3 5-6"></path></svg><span id="connection-text">Checking status...</span></p>
+          </div>
+        </div>
+        <button class="icon-button" id="details-button" aria-label="Details and policy" title="Details and policy">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"></path><circle cx="9" cy="7" r="2.3"></circle><circle cx="15" cy="17" r="2.3"></circle></svg>
+        </button>
+      </header>
+
+      <div class="separator"></div>
+
+      <div class="field inline-field access-field">
+        <label for="remote-access">Allow read-only requests</label>
+        <input type="checkbox" id="remote-access" class="circle-check" aria-label="Enable remote access">
+      </div>
+
+      <div class="field" id="local-write-mode" hidden>
+        <label for="approval-mode">Local write approval mode</label>
+        <div class="select-wrap">
+          <select id="approval-mode">
+            <option value="ask">Ask for approval</option>
+            <option value="auto">Auto-approve</option>
+            <option value="read_only">Read-only</option>
+          </select>
+          <svg class="chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>
+        </div>
+      </div>
+
+      <div class="field inline-field admin-field">
+        <div>
+          <strong>Windows administrator diagnostics</strong>
+          <p class="support-text" id="admin-diagnostics-status">Checking Windows helper…</p>
+        </div>
+      </div>
+
+      <section class="field" id="unattended-controls" hidden>
+        <strong>Unattended administrator access</strong>
+        <p class="support-text">ChatGPT can request access. After you approve, elevated commands run without additional prompts until the grant expires or you revoke it.</p>
+        <div class="pair-row">
+          <button type="button" class="pair-button" id="unattended-grant">Manage grant</button>
+          <button type="button" class="pair-button" id="unattended-revoke">Revoke access</button>
+        </div>
+      </section>
+      <section class="field admin-command-controls" id="admin-command-controls" hidden>
+        <strong>Elevated PowerShell with per-command approval</strong>
+        <p class="support-text" id="admin-command-status" aria-live="polite"></p>
+        <label for="admin-command-minutes">Grant duration in minutes</label>
+        <input id="admin-command-minutes" type="number" min="1" max="1440" value="30">
+        <div class="pair-row">
+          <button type="button" id="admin-command-timed" class="pair-button">Allow for minutes</button>
+          <button type="button" id="admin-command-permanent" class="pair-button">Allow until revoked</button>
+          <button type="button" id="admin-command-revoke" class="pair-button">Disable</button>
+        </div>
+        <p class="support-text">Each command still needs local approval and Windows elevation.</p>
+      </section>
+      <div class="field duration-field" id="local-write-duration" hidden>
+        <label for="approval-duration">Local write approval duration</label>
+        <div class="select-wrap">
+          <select id="approval-duration">
+            <option value="30">30 minutes</option>
+            <option value="60">1 hour</option>
+            <option value="240">4 hours</option>
+            <option value="persistent">Until disabled</option>
+          </select>
+          <svg class="chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>
+        </div>
+      </div>
+
+      <div class="separator middle-separator"></div>
+
+      <button class="nav-row" id="pairing-button">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4.5" width="18" height="13" rx="2"></rect><path d="M9 21h6M12 17.5V21"></path></svg>
+        <span class="nav-copy"><strong>Connect this PC</strong><small>Get a code to share with your gateway owner</small></span>
+        <svg class="arrow-right" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"></path></svg>
+      </button>
+
+      <button class="nav-row" id="approvals-button">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 7v5c0 5 3 7.5 8 9 5-1.5 8-4 8-9V7l-8-4z"></path><path d="m9 12 2 2 4-4"></path></svg>
+        <span class="nav-copy"><strong>Request approvals</strong><small id="approval-count">No pending requests</small></span>
+        <svg class="arrow-right" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"></path></svg>
+      </button>
+      <button class="nav-row" id="activity-button">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h10a2 2 0 0 1 2 2v4M8 3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8M4 8H2v11a2 2 0 0 0 2 2h2M10 8h6M10 12h7M10 16h6"></path></svg>
+        <span class="nav-copy"><strong>Recent activity</strong><small>Commands, patches and commits</small></span>
+        <svg class="arrow-right" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"></path></svg>
+      </button>
+
+      <div class="status-strip">
+        <span>Current status</span>
+        <strong id="status-text">Offline</strong>
+      </div>
+
+      <button class="revoke-button" id="revoke-button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3 21 21M10.5 5.2A8 8 0 0 1 20 9v4.8a2 2 0 0 0 .8 1.6M17.8 19H5a2 2 0 0 1-1.8-1.1L5 14V9c0-.5.1-.9.2-1.4M9 21h6"></path></svg>
+        Revoke Remote Access
+      </button>
+
+      <div class="field">
+        <p class="support-text" id="update-status" aria-live="polite"></p>
+        <button type="button" id="check-updates" class="pair-button">Check for updates</button>
+        <button type="button" id="open-release" class="pair-button" hidden>Open GitHub release</button>
+      </div>
+      <p class="footer-note" id="footer-note">Changes are saved on this computer.</p>
+    </section>
+
+    <section id="pairing" class="view subview" aria-label="Connect this PC">
+      <header class="sub-header">
+        <button class="back" data-back aria-label="Back to settings"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg></button>
+        <h2>Connect this PC</h2>
+      </header>
+      <div class="separator"></div>
+      <p class="pair-note">Send this code to the person setting up your connection. You can still decide which requests to approve on this PC.</p>
+      <button class="pair-button" id="connect-copy" disabled>Copy setup code</button>
+      <label class="pair-heading" for="connect-code">Setup code</label>
+      <input class="pair-input" id="connect-code" readonly spellcheck="false" autocomplete="off">
+      <div class="pair-heading">Device ID for verification</div>
+      <code class="pair-fingerprint" id="pair-host-id">Checking local agent...</code>
+      <details class="pair-divider">
+        <summary class="pair-heading">Advanced offline pairing</summary>
+        <p class="pair-note">This exchanges trusted identities locally. It does not register a PC with the gateway.</p>
+        <div class="pair-row">
+          <button class="pair-button" id="pair-create">Create 10-minute invitation</button>
+          <button class="pair-button pair-secondary" id="pair-cancel">Cancel</button>
+        </div>
+        <label class="pair-heading" for="pair-output">Exchange output (keep invitations private)</label>
+        <textarea id="pair-output" class="pair-data" rows="4" readonly spellcheck="false" aria-label="Output to transfer to the other device"></textarea>
+        <button class="pair-button pair-secondary" id="pair-copy">Copy exchange output</button>
+        <div class="separator pair-divider"></div>
+        <label class="pair-heading" for="pair-action">Received exchange</label>
+        <select class="pair-select" id="pair-action">
+          <option value="prepare">Join using invitation</option>
+          <option value="accept">Accept signed join request</option>
+          <option value="finalize">Finalize signed receipt</option>
+        </select>
+        <label class="pair-heading" for="pair-name">Device name (joining / finalizing)</label>
+        <input class="pair-input" id="pair-name" maxlength="64" placeholder="e.g. Living room PC">
+        <textarea id="pair-input" class="pair-data" rows="4" spellcheck="false" placeholder="Paste JSON from the other device" aria-label="Paste received pairing data"></textarea>
+        <button class="pair-button" id="pair-process">Verify and process exchange</button>
+        <div class="separator pair-divider"></div>
+        <div class="pair-heading">Trusted identities (no remote access)</div>
+        <div id="pair-peers" class="pair-peer-list"><p class="empty-history">No devices enrolled.</p></div>
+      </details>
+    </section>
+
+    <section id="approvals" class="view subview" aria-label="Requests awaiting local review">
+      <header class="sub-header">
+        <button class="back" data-back aria-label="Back to settings"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg></button>
+        <h2>Request approvals</h2>
+      </header>
+      <div class="separator"></div>
+      <p class="approval-note">Approve or deny each permission and each tool request separately. Revoke remote access in Settings to clear grants.</p>
+      <div id="approval-list" class="approval-list" aria-live="polite">
+        <p class="empty-history">Checking for requests...</p>
+      </div>
+    </section>
+    <section id="activity" class="view subview" aria-label="Recent activity">
+      <header class="sub-header">
+        <button class="back" data-back aria-label="Back to settings"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg></button>
+        <h2>Recent activity</h2>
+      </header>
+      <div class="separator"></div>
+      <div id="activity-list" class="activity-list"></div>
+    </section>
+
+    <section id="details" class="view subview" aria-label="Details and policy">
+      <header class="sub-header">
+        <button class="back" data-back aria-label="Back to settings"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg></button>
+        <h2>Details &amp; policy</h2>
+      </header>
+      <div class="separator"></div>
+      <div class="info-row"><span>Computer</span><strong id="host-name">Unknown</strong></div>
+      <div class="info-row"><span>Platform</span><strong id="platform-name">Unknown</strong></div>
+      <div class="info-row"><span>Remote access</span><strong id="remote-access-status">Checking…</strong></div>
+      <div class="info-row"><span>Local agent</span><strong id="local-agent-status">Not running</strong></div>
+      <div class="info-row"><span>Local approval</span><strong id="local-approval-status">Not active</strong></div>
+       <div class="separator"></div>
+      <p class="info-note">Remote tools are limited to the configured project. Each Git status or file read requires approval for that exact request.</p>
+    </section>
+
+    <dialog class="confirmation" id="confirmation" aria-labelledby="confirmation-message">
+      <p id="confirmation-message"></p>
+      <form method="dialog">
+        <button type="submit" class="pair-button" value="cancel" autofocus>Cancel</button>
+        <button type="submit" class="pair-button" value="confirm">Continue</button>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </main>
+</body>
+</html>

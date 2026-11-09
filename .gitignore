@@ -1,0 +1,16 @@
+/src-tauri/target/
+/target/
+/src-tauri/gen/
+/node_modules/
+/dist/
+*.log
+*.pfx
+*.key
+.env
+.env.*
+settings.json
+
+/gateway/target/
+/agent/target/
+__pycache__/
+*.pyc
