@@ -1,51 +1,84 @@
-# Generic gateway endpoint setup
+# Desktop MCP family enrollment and gateway setup
 
-Desktop MCP installers should be reusable across self-hosted gateways. This
-branch adds the first-run public endpoint field and per-user persistence.
+The Desktop MCP plugin, gateway routes and protected administrator interface remain
+private on the NAS. The Windows **installer** can be publicly distributed.
 
-## Endpoint
+## What is included
 
-- Installer accepts a public IPv4 address, an IPv6 address, or a DNS hostname.
-- Optional UDP port (default 51820) is for WireGuard, **not** the Desktop MCP
-  gateway's TLS/relay listener.
-- Endpoint is saved as `gateway-endpoint.json` in the owner's private
-  `%APPDATA%\com.jacqueb.desktopmcp` directory.
-- Existing installations load the saved file and do not prompt again.
-- `SaveNew` intentionally refuses to overwrite existing configuration.
-- The existing tray-only update does not modify this state. The full installer
-  still refuses in-place upgrades, so implementing safe service upgrades remains
-  a separate release blocker.
-- To change an endpoint deliberately, use a future owner-facing Settings UI with
-  explicit confirmation and update of the WireGuard tunnel endpoint.
+- Windows agent, tray and protected unattended SYSTEM service
+- The signed official WireGuard Windows MSI, verified by publisher and pinned digest
+- The NAS WireGuard **public** server key and public TLS CA certificate
+- Only the internal tunnel gateway address (`10.93.42.1:19874`)
+- A first-run public IPv4, IPv6 or DNS hostname field with UDP port 51820 default
 
-## Authentication (required before usable remote release)
+No NAS public IP, WireGuard PRIVATE keys, passwords or MCP access tokens are in the
+public installer. There is no internet-facing MCP TCP port.
 
-The public IP alone **cannot** authenticate a gateway or enroll a machine.
-The WireGuard server public key must be authenticated, the new PC must generate
-its own private key locally, and the NAS must register only that PC's public key.
-Each device must use its own peer key. Never bundle private peer keys, service
-tokens, or NAS TLS private keys in a publicly available installer.
+## End user
 
-The Windows WireGuard tunnel service must be installed, started and configured
-before the protected Desktop MCP service attempts to reach its private gateway
-address. The protected service must be included and installed with the owner's
-explicit Windows authorization. Pairing and unattended access grants remain
-separate owner decisions.
+1. Run the installer, enter the **public** IP or DNS name (UDP port defaults to
+   51820). It is saved in `%APPDATA%\com.jacqueb.desktopmcp\gateway-endpoint.json`.
+2. Approve the Windows UAC request to install the signed WireGuard tunnel and
+   protected unattended service. Each PC generates a fresh private WireGuard key
+   and saves it under administrator-protected ProgramData. It does NOT share its
+   private key with the NAS administrator.
+3. Share the single displayed `DMW1:DM1-...:<wg-public-key>` registration code
+   with the NAS administrator. The code contains only public identities.
+4. Wait for the NAS owner to approve both its Desktop MCP signing identity
+   and its WireGuard public key. Once authorized the WireGuard tunnel can
+   authenticate and the agent can reach the private TLS gateway.
+5. The PC owner separately approves a temporary or until-revoked unattended
+   administrator grant. Pairing alone confers NO administrator access.
 
-The existing protected service installer still reads an embedded gateway TLS
-configuration. The Windows tunnel-client provisioning and generic credential
-exchange are **not yet implemented**. This is an endpoint-configuration feature,
-not an end-to-end remote connection release.
+## NAS owner registration
 
-## Verification
+- The private NAS tool `/usr/local/sbin/desktop-mcp-register-peer` validates the
+  owner's combined code and registers the WireGuard public key with an address
+  derived from the 32-byte DM1 signing public key. It also persists a peer section
+  in `/etc/wireguard/wgdmcp.conf`, and allows revocation without restarting
+  the server.
+- Parse the `DMW1` code into its `DM1-<64hex>` identity and
+  `<44-character-WireGuard-public-key>` fields.
+- First authorize the `DM1` device through the private Desktop MCP
+  `pair_device` tool. Then, after verifying the device owner, run as NAS root:
 
-Build the installer with `docs/build-windows-setup.ps1` and run an isolated test:
+  ```
+  desktop-mcp-register-peer enroll '<DM1-code>' '<WireGuard-public-key>'
+  ```
 
-```powershell
-$compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-& $compiler /nologo /target:exe /warnaserror+ /reference:System.Web.Extensions.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:$env:TEMP\GatewayEndpointTests.exe docs\GatewayEndpoint.cs docs\GatewayEndpointTests.cs
-& $env:TEMP\GatewayEndpointTests.exe
-```
+- To revoke tunnel entry:
 
-The test checks parsing, invalid inputs, persistence, reload, and refusal to
-replace an existing gateway. It does not touch a live Desktop MCP installation.
+  ```
+  desktop-mcp-register-peer revoke '<DM1-code>'
+  ```
+
+  Revoke Desktop MCP pairing and existing grants separately. These are
+  independent authorization boundaries.
+
+- NAS Wi-Fi LAN IP `192.168.1.159`, WireGuard server UDP port `51820`.
+  Router must forward **only UDP 51820** to `192.168.1.159:51820`.
+  No TCP port to the NAS or to Windows is required for family access.
+- The WireGuard gateway is `10.93.42.1/16`, with host-specific peer /32s.
+  nftables drops all client traffic except TCP 19874 to the private gateway.
+  It does NOT permit forwarding to other NAS networks or services.
+- `wg-quick@wgdmcp`, `desktop-mcp-wg-proxy.socket`, and
+  `desktop-mcp-gateway.service` are enabled and running.
+- Peer registration is local, root-only and **not publicly hosted**.
+
+## Validation and release status
+
+- Public endpoint parsing, saving, reloading and no-overwrite tests passed.
+- Windows peer-identity derivation, key-validation, and narrow route tests passed.
+- The full candidate builds, including nested service and official WireGuard MSI.
+- An isolated Linux network namespace successfully authenticated via UDP
+  WireGuard to the NAS, reached the restricted TCP proxy and verified gateway
+  TLS against the correct pinned CA. Temporary test peer was removed afterward.
+
+**Not yet approved for public release:** a fresh Windows install, WireGuard
+tunnel service installation and startup after owner UAC, first external UDP
+connection through the router, and subsequent Windows reboot must be tested.
+The existing setup program still refuses an in-place application update.
+It correctly reuses a saved gateway address without prompting, but a real
+safe in-place updating workflow must be implemented and tested before calling
+upgrades supported. Do not distribute the development release candidate as
+production-ready.

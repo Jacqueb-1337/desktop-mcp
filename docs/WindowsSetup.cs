@@ -93,6 +93,8 @@ internal static class WindowsSetup
                         "Protected service setup did not finish. Ordinary Desktop MCP remains installed.");
                 }
             }
+            string registrationPath = Path.Combine(state, "wireguard-registration.txt");
+            if (File.Exists(registrationPath)) code = File.ReadAllText(registrationPath).Trim();
             ShowCode(code);
         }
         catch (Exception error)
@@ -136,6 +138,7 @@ internal static class WindowsSetup
             trayJob = Register(tasks, service, trayTask, user.Value, tray, install, "", false);
             agentJob.Run(null);
             string code = WaitForCode(agent, install, state);
+            File.WriteAllText(Path.Combine(state, "connection-code.txt"), code + "\n");
             using (var config = typeof(WindowsSetup).Assembly.GetManifestResourceStream("gateway"))
             {
                 if (config != null)
@@ -211,6 +214,7 @@ internal static class WindowsSetup
                 rule.IdentityReference.Value!="S-1-5-32-544" && rule.IdentityReference.Value!="S-1-5-18" &&
                 (rule.FileSystemRights&dangerous)!=0)
                 throw new InvalidOperationException("Protected Desktop MCP directory is writable by a non-administrator.");
+        OfficialWireGuardInstaller.EnsureInstalled(root);
         string bootstrap=Path.Combine(root,"DesktopMCPServiceBootstrap-"+Guid.NewGuid().ToString("N")+".exe");
         using (var resource=typeof(WindowsSetup).Assembly.GetManifestResourceStream("unattended-service"))
         {

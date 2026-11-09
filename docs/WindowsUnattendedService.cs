@@ -289,6 +289,10 @@ internal sealed class DesktopService : ServiceBase
         PrivateDirectory(DataRoot);
         PrivateDirectory(State);
         PrivateDirectory(InstallRoot);
+        // Provision a per-PC private tunnel before stopping the existing Windows
+        // service, so an enrollment failure cannot interrupt a working install.
+        string registration = WireGuardTunnelInstaller.EnsureTunnel(userState, DataRoot);
+        File.WriteAllText(Path.Combine(userState,"wireguard-registration.txt"),registration + "\n");
         if(ServiceExists()){
             try{RunSc("stop "+Name);}catch{}
             Thread.Sleep(900);
@@ -324,6 +328,7 @@ internal sealed class DesktopService : ServiceBase
         // Prints only the public, derived host id. The secret never enters command-line arguments.
         var host=GetHostIdentity();
         File.WriteAllText(Path.Combine(DataRoot,"host-id.txt"),host);
+
         if(!ServiceExists()){
             RunSc("create "+Name+" binPath= \"\\\""+ServiceExe+"\\\"\""+" start= auto obj= LocalSystem DisplayName= "+Quote("Desktop MCP Unattended"));
         }
