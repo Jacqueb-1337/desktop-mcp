@@ -49,8 +49,13 @@ pub fn grant_id(state:&Path,host_id:&str)->Option<Uuid> {
     grant_id_for(state,host_id,crate::elevation::COMMAND)
 }
 pub fn grant_id_for(state:&Path,host_id:&str,tool:&str)->Option<Uuid> {
-    let user=matches!(tool,crate::user_command::TOOL|crate::user_command::RESULT);
-    let (file,scope)=if user {("user-grant.json","unattended_user")}else{("grant.json","unattended_admin")};
+    let tool=if crate::terminal::is_tool(tool){crate::terminal::scope(tool)}else{tool};
+    let (file,scope)=match tool {
+        crate::user_command::TOOL|crate::user_command::RESULT=>("user-grant.json","unattended_user"),
+        crate::user_command::ELEVATED|crate::user_command::ELEVATED_RESULT=>("elevated-user-grant.json","unattended_elevated_user"),
+        crate::elevation::COMMAND|"admin_command_result"=>("grant.json","unattended_admin"),
+        _=>return None,
+    };
     let root=machine_root().ok()?;
     let expected=root.join("State").canonicalize().ok()?;
     if state.canonicalize().ok()? != expected {return None;}
@@ -95,8 +100,8 @@ pub fn owner_decision(state:&Path,frame:&Value)->Option<bool> {
     if record["request_id"]!=frame["request_id"] {return None;}
     // A legacy supervisor must never approve the new user scope with its
     // administrator-only prompt. Old admin decisions remain compatible.
-    if frame["arguments"]["capability"]==crate::user_command::TOOL &&
-        record["capability"]!=crate::user_command::TOOL {return None;}
+    if matches!(frame["arguments"]["capability"].as_str(),Some(crate::user_command::TOOL|crate::user_command::ELEVATED)) &&
+        record["capability"]!=frame["arguments"]["capability"] {return None;}
     if !record["capability"].is_null() && record["capability"]!=frame["arguments"]["capability"] {return None;}
     record["approved"].as_bool()
 }
@@ -115,6 +120,7 @@ pub fn issue_grant(state:&Path,frame:&Value)->Result<(),String> {
     let (file,scope)=match frame["arguments"]["capability"].as_str() {
         Some(crate::elevation::COMMAND)=>("grant.json","unattended_admin"),
         Some(crate::user_command::TOOL)=>("user-grant.json","unattended_user"),
+        Some(crate::user_command::ELEVATED)=>("elevated-user-grant.json","unattended_elevated_user"),
         _=>return Err("INVALID_PERMISSION_SCOPE".into()),
     };
     let grant=json!({
@@ -222,7 +228,7 @@ impl Drop for Task {
 impl Task {
     pub fn start(frame:&Value,state:&Path,host:&str,grant:Uuid)->Result<Self,String>{
         let tool=frame["tool"].as_str().ok_or("COMMAND_TOOL_REQUIRED")?;
-        if !matches!(tool,crate::elevation::COMMAND|crate::user_command::TOOL) {
+        if !matches!(tool,crate::elevation::COMMAND|crate::user_command::TOOL|crate::user_command::ELEVATED) {
             return Err("COMMAND_TOOL_INVALID".into());
         }
         if grant_id_for(state,host,tool)!=Some(grant){return Err("UNATTENDED_GRANT_INACTIVE".into());}
@@ -267,9 +273,9 @@ fn run(command:&str,state:&Path,host:&str,expires:u64,grant:Uuid,canceled:&Atomi
     let now=epoch();
     if expires<=now || expires-now>120 {return json!({"pending":false,"executed":false,"error":"ROUTE_EXPIRED"});}
     #[cfg(windows)]
-    if tool==crate::user_command::TOOL {
+    if matches!(tool,crate::user_command::TOOL|crate::user_command::ELEVATED) {
         let deadline=Instant::now()+Duration::from_secs(expires.saturating_sub(now).min(100));
-        return match crate::user_command::run(command,state,||authorized() && epoch()<expires && Instant::now()<deadline) {
+        return match crate::user_command::run(command,state,tool==crate::user_command::ELEVATED,||authorized() && epoch()<expires && Instant::now()<deadline) {
             Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
             Err(error)=>json!({"pending":false,"executed":false,"error":error}),
         };
@@ -391,6 +397,11 @@ mod tests {
         assert!(!valid_scoped_grant(&grant,"hostA",1500,"unattended_admin"));
         grant["scope"]=json!("unattended_admin");
         assert!(valid_scoped_grant(&grant,"hostA",1500,"unattended_admin"));
+        assert!(!valid_scoped_grant(&grant,"hostA",1500,"unattended_user"));
+        assert!(!valid_scoped_grant(&grant,"hostA",1500,"unattended_elevated_user"));
+        grant["scope"]=json!("unattended_elevated_user");
+        assert!(valid_scoped_grant(&grant,"hostA",1500,"unattended_elevated_user"));
+        assert!(!valid_scoped_grant(&grant,"hostA",1500,"unattended_admin"));
         assert!(!valid_scoped_grant(&grant,"hostA",1500,"unattended_user"));
     }
     #[test]fn base64_is_correct(){

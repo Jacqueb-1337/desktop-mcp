@@ -5,11 +5,16 @@ use serde_json::Value;
 use std::path::Path;
 use uuid::Uuid;
 
+pub fn base_tool(tool:&str)->&str {
+    tool.strip_prefix("elevated_user_").or_else(||tool.strip_prefix("user_")).unwrap_or(tool)
+}
 pub fn is_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "terminal_open" | "terminal_list" | "terminal_run" | "terminal_read" | "terminal_close"
-    )
+    matches!(base_tool(tool),"terminal_open"|"terminal_list"|"terminal_run"|"terminal_read"|"terminal_close")
+}
+pub fn scope(tool:&str)->&'static str {
+    if tool.starts_with("elevated_user_"){crate::user_command::ELEVATED}
+    else if tool.starts_with("user_"){crate::user_command::TOOL}
+    else {crate::elevation::COMMAND}
 }
 
 pub fn start_cleanup(state: &Path) -> Result<(), String> {
@@ -35,7 +40,7 @@ pub fn valid_args(tool: &str, args: &Value) -> bool {
             })
         })
     };
-    match tool {
+    match base_tool(tool) {
         "terminal_open" | "terminal_list" => fields.is_empty(),
         "terminal_run" => {
             id("terminal_id")
@@ -54,6 +59,22 @@ pub fn valid_args(tool: &str, args: &Value) -> bool {
         }
         "terminal_close" => id("terminal_id") && fields.len() == 1,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    #[test]
+    fn contexts_are_exact_and_scope_bound() {
+        for (prefix,scope_name) in [("","admin_command"),("user_","user_command"),("elevated_user_","elevated_user_command")] {
+            let tool=format!("{prefix}terminal_open");
+            assert!(is_tool(&tool));
+            assert!(valid_args(&tool,&serde_json::json!({})));
+            assert_eq!(scope(&tool),scope_name);
+        }
+        assert!(!is_tool("user_elevated_user_terminal_open"));
+        assert!(!valid_args("user_terminal_open",&serde_json::json!({"context":"system"})));
     }
 }
 
@@ -113,7 +134,7 @@ mod windows {
     const CHECKPOINT: Duration = Duration::from_secs(5);
     const RECORD_LIMIT: u64 = 2 * OUTPUT_LIMIT as u64 + 65536;
 
-    const BOOTSTRAP: &str = r#"
+    pub(crate) const BOOTSTRAP: &str = r#"
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $ProgressPreference = 'SilentlyContinue'
 while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
@@ -180,13 +201,13 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         }
         fn read(&self, offset: Option<u64>) -> Value {
             let end = self.start + self.output.len() as u64;
-            let requested = offset.unwrap_or_else(|| end.saturating_sub(4096));
+            let requested = offset.unwrap_or_else(|| end.saturating_sub(16384));
             let from = requested.clamp(self.start, end);
             let bytes: Vec<u8> = self
                 .output
                 .iter()
                 .skip((from - self.start) as usize)
-                .take(4096)
+                .take(16384)
                 .copied()
                 .collect();
             json!({"terminal":self.summary(),"commands":self.commands,
@@ -372,6 +393,8 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
             tool: &str,
             args: &Value,
         ) -> Result<Value, String> {
+            let execution_scope=scope(tool);
+            let tool=base_tool(tool);
             self.active.retain(|_, session| {
                 session
                     .record
@@ -433,25 +456,25 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 let worker_stop = stop.clone();
                 let state = state.to_path_buf();
                 let host = host.to_owned();
-                let (child, job) = start_shell()?;
+                let shell=Shell::start(&state,execution_scope)?;
                 thread::Builder::new()
                     .name("desktop-mcp-terminal".into())
                     .spawn(move || {
                         run(
-                            child,
-                            job,
+                            shell,
                             worker,
                             receive,
                             worker_stop,
                             state,
                             host,
                             grant,
+                            execution_scope,
                             path,
                         )
                     })
                     .map_err(|_| "TERMINAL_WORKER_UNAVAILABLE")?;
                 self.active.insert(id, Session { record, send, stop });
-                return Ok(json!({"terminal_id":id.to_string(),"visibility":"hidden"}));
+                return Ok(json!({"terminal_id":id.to_string(),"visibility":"hidden","context":if execution_scope==crate::user_command::ELEVATED {"elevated_user"}else if execution_scope==crate::user_command::TOOL {"user"}else{"system"}}));
             }
             let id = Uuid::parse_str(args["terminal_id"].as_str().ok_or("TERMINAL_ID_REQUIRED")?)
                 .map_err(|_| "INVALID_TERMINAL_ID")?;
@@ -595,18 +618,57 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         }
     }
 
+    enum Process {
+        System(Child),
+        User(OwnedHandle),
+    }
+    impl Process {
+        fn alive(&mut self)->bool {
+            match self {
+                Self::System(child)=>matches!(child.try_wait(),Ok(None)),
+                Self::User(handle)=> (unsafe{windows_sys::Win32::System::Threading::WaitForSingleObject(handle.as_raw_handle(),0)})==windows_sys::Win32::Foundation::WAIT_TIMEOUT,
+            }
+        }
+        fn wait(&mut self) {
+            match self {
+                Self::System(child)=>{let _=child.wait();},
+                Self::User(handle)=>{unsafe{windows_sys::Win32::System::Threading::WaitForSingleObject(handle.as_raw_handle(),5000);}},
+            }
+        }
+    }
+    struct Shell {
+        process:Process,
+        job:OwnedHandle,
+        input:Box<dyn Write+Send>,
+        stdout:Box<dyn Read+Send>,
+        stderr:Box<dyn Read+Send>,
+    }
+    impl Shell {
+        fn start(state:&Path,execution_scope:&str)->Result<Self,String>{
+            if execution_scope==crate::elevation::COMMAND {
+                let (mut child,job)=start_shell()?;
+                let input=Box::new(child.stdin.take().ok_or("TERMINAL_PIPE_FAILED")?);
+                let stdout=Box::new(child.stdout.take().ok_or("TERMINAL_PIPE_FAILED")?);
+                let stderr=Box::new(child.stderr.take().ok_or("TERMINAL_PIPE_FAILED")?);
+                Ok(Self{process:Process::System(child),job,input,stdout,stderr})
+            }else{
+                let child=crate::user_command::terminal_shell(state,execution_scope==crate::user_command::ELEVATED)?;
+                Ok(Self{process:Process::User(child.process),job:child.job,input:Box::new(child.input),stdout:Box::new(child.output),stderr:Box::new(child.error)})
+            }
+        }
+    }
     fn run(
-        mut child: Child,
-        job: OwnedHandle,
+        shell:Shell,
         record: Arc<Mutex<Record>>,
         receive: mpsc::Receiver<Work>,
         stop: Arc<AtomicBool>,
         state: PathBuf,
         host: String,
         grant: Uuid,
+        execution_scope:&'static str,
         path: PathBuf,
     ) {
-        let mut input = child.stdin.take().expect("piped stdin");
+        let Shell{mut process,job,mut input,stdout,stderr}=shell;
         let (input_send, input_receive) = mpsc::sync_channel::<String>(1);
         let _ = thread::spawn(move || {
             for line in input_receive {
@@ -618,8 +680,6 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 }
             }
         });
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
         let (send, output) = mpsc::sync_channel(32);
         let stdout_send = send.clone();
         let _ = thread::spawn(move || drain(stdout, stdout_send, true));
@@ -632,7 +692,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
             if stop.load(Ordering::Acquire) {
                 break "closed";
             }
-            if unattended::grant_id(&state, &host) != Some(grant)
+            if unattended::grant_id_for(&state, &host,execution_scope) != Some(grant)
                 || !state.join("remote-readonly.enabled").is_file()
             {
                 break "grant_inactive";
@@ -659,7 +719,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
             }
-            if !matches!(child.try_wait(), Ok(None)) {
+            if !process.alive() {
                 break "shell_exited";
             }
             let mut drained = 0;
@@ -712,7 +772,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         };
         drop(input_send);
         drop(job);
-        let _ = child.wait();
+        process.wait();
         if let Ok(mut entry) = record.lock() {
             while let Ok((_, bytes)) = output.recv_timeout(Duration::from_millis(25)) {
                 entry.append(&bytes);
@@ -788,3 +848,5 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
 
 #[cfg(windows)]
 pub use windows::Pool;
+#[cfg(windows)]
+pub(crate) use windows::BOOTSTRAP;

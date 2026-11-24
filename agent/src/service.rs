@@ -291,7 +291,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 if route["version"]!=2 || !policy.admin_commands_enabled {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 }
-                if tool=="request_permission" && matches!(capability,elevation::COMMAND|crate::user_command::TOOL) {
+                if tool=="request_permission" && matches!(capability,elevation::COMMAND|crate::user_command::TOOL|crate::user_command::ELEVATED) {
                     if policy.system_request.is_some() {return json!({"error":"SYSTEM_PERMISSION_BUSY"});}
                     let scope=agent.authorization_scope().to_str().unwrap_or("");
                     return match inbox.stage(route,Some(scope)).and_then(|queued| {
@@ -303,13 +303,13 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                         Err(error)=>json!({"error":error}),
                     };
                 }
-                if !matches!(tool,elevation::COMMAND|"admin_command_result"|crate::user_command::TOOL|crate::user_command::RESULT) && !crate::terminal::is_tool(tool) {
+                if !matches!(tool,elevation::COMMAND|"admin_command_result"|crate::user_command::TOOL|crate::user_command::RESULT|crate::user_command::ELEVATED|crate::user_command::ELEVATED_RESULT) && !crate::terminal::is_tool(tool) {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 }
                 let Some(grant)=unattended::grant_id_for(dir,host,tool) else {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 };
-                if matches!(tool,elevation::COMMAND|crate::user_command::TOOL) && policy.system_runs.len()>=4 {
+                if matches!(tool,elevation::COMMAND|crate::user_command::TOOL|crate::user_command::ELEVATED) && policy.system_runs.len()>=4 {
                     return json!({"error":"SYSTEM_COMMAND_BUSY"});
                 }
                 return match inbox.approve_automatic(route) {
@@ -320,7 +320,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     Err(error)=>json!({"error":error}),
                 };
             }
-            if matches!(tool,"admin_command_result"|crate::user_command::TOOL|crate::user_command::RESULT) || (tool=="request_permission" && capability==crate::user_command::TOOL) || crate::terminal::is_tool(tool) {return json!({"error":"LOCAL_PERMISSION_REQUIRED"});}
+            if matches!(tool,"admin_command_result"|crate::user_command::TOOL|crate::user_command::RESULT|crate::user_command::ELEVATED|crate::user_command::ELEVATED_RESULT) || (tool=="request_permission" && matches!(capability,crate::user_command::TOOL|crate::user_command::ELEVATED)) || crate::terminal::is_tool(tool) {return json!({"error":"LOCAL_PERMISSION_REQUIRED"});}
             if elevation::is_privileged(capability) && !policy.privileged_enabled(capability) {
                 return json!({"error":"ADMIN_HELPER_UNAVAILABLE"});
             }
@@ -420,7 +420,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                         Err(error)=>rejected(error),
                     };
                 }
-                if matches!(tool,"admin_command_result"|crate::user_command::RESULT) {
+                if matches!(tool,"admin_command_result"|crate::user_command::RESULT|crate::user_command::ELEVATED_RESULT) {
                     return match inbox.consume(frame).and_then(|spent| {
                         if !spent {return Err("LOCAL_APPROVAL_REQUIRED".into());}
                         unattended::command_result(dir,grant,&frame["arguments"]["run_id"])

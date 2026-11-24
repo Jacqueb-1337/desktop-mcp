@@ -7,9 +7,9 @@ approval from the Windows owner.
 
 ## Windows release
 
-- **DesktopMCP-Setup-v0.3.3.exe** installs or upgrades the Windows tray, agent and optional protected service. Existing installations keep their pairing and gateway configuration. The setup is unsigned and bundles the signed WireGuard MSI.
+- **DesktopMCP-Setup-v0.3.4.exe** installs or upgrades the Windows tray, agent and optional protected service. Existing installations keep their pairing and gateway configuration. The setup is unsigned and bundles the signed WireGuard MSI.
 - The bundled trust configuration identifies the private family gateway. For another gateway, build with its public trust configuration.
-- **DesktopMCP-Tray-v0.3.3.exe** updates the tray component only.
+- **DesktopMCP-Tray-v0.3.4.exe** updates the tray component only.
 - See docs/WINDOWS-UPGRADE.md for upgrade behavior and docs/GATEWAY-SETUP.md for fresh installations.
 - SHA256SUMS.txt lists the hashes of the downloadable release executables.
 

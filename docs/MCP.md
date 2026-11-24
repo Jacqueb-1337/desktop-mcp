@@ -85,3 +85,13 @@ Administrators may access credentials. Untrusted writable ancestor directories
 fail verification. The Windows installer protects only dedicated app directories
 and files, and registers a Limited per-user task. Unix journal tests explicitly
 create mode-0700 directories; production audit checks remain unchanged.
+
+## Windows execution contexts (0.3.4)
+
+- `admin_command`: existing unattended SYSTEM execution and authorization.
+- `user_command`: non-elevated signed-in installation owner, with separate permission.
+- `elevated_user_command`: elevated signed-in installation owner, with separate explicit permission. Requires an administrator token belonging to that owner; never falls back to SYSTEM.
+- Persistent terminal tools accept `context` (`system`, `user`, `elevated_user`). Use the same context for open, list, run, read and close. The default remains `system`.
+- Each permission can be temporary or permanent until revoked. The existing elevated Windows service remains responsible for enforcing them. Owner-session execution requires the owner to be signed in; a machine with no owner session fails closed.
+- User-session shells use the owner's Windows profile and available network credentials. Windows may expose different SMB drive mappings to elevated and non-elevated tokens. If a drive is not present, use its UNC path when accessible, or establish a mapping with the owner's approval. No credentials are copied or automatically changed.
+- The terminal limit remains four per PC. Up to four one-shot routes can be in flight independently, and terminal output pages contain up to 16 KiB.

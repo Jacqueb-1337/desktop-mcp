@@ -100,13 +100,12 @@ impl Broker {
     }
     pub fn policy_decision(&self, intent: &Intent, host: &str) -> Decision {
         let mut mapped;
-        let intent=if intent.tool=="user_command_result" {
+        let intent=if intent.tool=="user_command_result" || intent.tool=="elevated_user_command_result" || intent.tool=="admin_command_result" || terminal_tool(&intent.tool) {
             mapped=intent.clone();
-            mapped.tool="user_command".into();
-            &mapped
-        } else if intent.tool=="admin_command_result" || terminal_tool(&intent.tool) {
-            mapped=intent.clone();
-            mapped.tool="admin_command".into();
+            mapped.tool=if terminal_tool(&intent.tool) {
+                if intent.tool.starts_with("elevated_user_") {"elevated_user_command"}
+                else if intent.tool.starts_with("user_") {"user_command"} else {"admin_command"}
+            } else {intent.tool.strip_suffix("_result").unwrap_or(&intent.tool)}.into();
             &mapped
         } else {intent};
         let decision=self.policy.decide(intent,host);
@@ -201,6 +200,18 @@ impl Broker {
             );
         }
         let host = args["host_id"].as_str().ok_or("HOST_REQUIRED")?;
+        // Bind terminal context into the authenticated tool name, not just the
+        // caller payload. Old clients that omit context keep SYSTEM behavior.
+        let wire_tool;
+        let tool=if terminal_tool(tool) {
+            wire_tool=match args.get("context").and_then(Value::as_str).unwrap_or("system") {
+                "system"=>tool.to_owned(),
+                "user"=>format!("user_{tool}"),
+                "elevated_user"=>format!("elevated_user_{tool}"),
+                _=>return Err("INVALID_EXECUTION_CONTEXT".into()),
+            };
+            wire_tool.as_str()
+        }else{tool};
         let request_id = args["request_id"]
             .as_str()
             .map(str::to_string)
@@ -211,14 +222,14 @@ impl Broker {
             workspace_id: "default".into(),
             tool: tool.into(),
         };
-        if !matches!(tool, "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result") && !terminal_tool(tool)
+        if !matches!(tool, "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result" | "elevated_user_command" | "elevated_user_command_result") && !terminal_tool(tool)
             || self.policy_decision(&intent, host) != Decision::RequiresLocalApproval
         {
             return Err("POLICY_DENIED".into());
         }
         if tool == "request_permission" {
             let capability = args["capability"].as_str().ok_or("CAPABILITY_REQUIRED")?;
-            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command")
+            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command" | "elevated_user_command")
                 || !args["duration"].as_str().is_some_and(crate::policy::valid_duration)
             {
                 return Err("INVALID_PERMISSION_REQUEST".into());
@@ -231,7 +242,7 @@ impl Broker {
                 }
             }
         }
-        if matches!(tool,"admin_command"|"user_command") && !args["command"].as_str().is_some_and(crate::policy::valid_command) {
+        if matches!(tool,"admin_command"|"user_command"|"elevated_user_command") && !args["command"].as_str().is_some_and(crate::policy::valid_command) {
             return Err("INVALID_ADMIN_COMMAND".into());
         }
         let tx = self
@@ -255,12 +266,12 @@ impl Broker {
             "patch_prepare" => json!({"expected_head":args["expected_head"],"changes":args["changes"]}),
             "patch_review"|"patch_status"|"patch_apply" => json!({"patch_id":args["patch_id"]}),
             "git_commit_patch" => json!({"patch_id":args["patch_id"],"message":args["message"]}),
-            "admin_command"|"user_command" => json!({"command":args["command"]}),
-            "admin_command_result"|"user_command_result" => json!({"run_id":args["run_id"]}),
+            "admin_command"|"user_command"|"elevated_user_command" => json!({"command":args["command"]}),
+            "admin_command_result"|"user_command_result"|"elevated_user_command_result" => json!({"run_id":args["run_id"]}),
             tool if terminal_tool(tool) => {
                 let mut payload=args.clone();
                 if let Some(fields)=payload.as_object_mut() {
-                    for key in ["host_id","workspace_id","request_id"] {fields.remove(key);}
+                    for key in ["host_id","workspace_id","request_id","context"] {fields.remove(key);}
                 }
                 payload
             },
@@ -296,12 +307,12 @@ impl Broker {
     }
 }
 pub fn terminal_tool(tool:&str)->bool {
-    matches!(tool,"terminal_open"|"terminal_list"|"terminal_run"|"terminal_read"|"terminal_close")
+    matches!(tool.strip_prefix("elevated_user_").or_else(||tool.strip_prefix("user_")).unwrap_or(tool),"terminal_open"|"terminal_list"|"terminal_run"|"terminal_read"|"terminal_close")
 }
 
 fn paired_scope(host:&str)->HostScope {
     HostScope{host_id:host.into(),workspace_id:"default".into(),
-        tools:vec!["request_permission".into(),"admin_command".into(),"user_command".into()]}
+        tools:vec!["request_permission".into(),"admin_command".into(),"user_command".into(),"elevated_user_command".into()]}
 }
 pub fn setup_key(code:&str)->Option<(String,String)> {
     let key=code.strip_prefix("DM1-")?;
@@ -349,7 +360,7 @@ pub fn verify_result(result: &Value, frame: &Value) -> Result<(), String> {
     {
         return Err("ROUTE_OUTCOME_INVALID".into());
     }
-    if matches!(frame["tool"].as_str(),Some("admin_command"|"user_command")) && outcome.get("data").is_some()
+    if matches!(frame["tool"].as_str(),Some("admin_command"|"user_command"|"elevated_user_command")) && outcome.get("data").is_some()
         && !outcome["data"].as_object().is_some_and(|data| {
             data.len() == 4 && outcome["data"]["exit_code"].as_i64().is_some_and(|n| i32::try_from(n).is_ok())
                 && outcome["data"]["stdout"].as_str().is_some_and(|s| s.len() <= 24_000)
@@ -369,7 +380,7 @@ pub fn verify_result(result: &Value, frame: &Value) -> Result<(), String> {
     if frame["tool"]=="request_permission" && outcome.get("data").is_some() {
         let mut expected=json!({"capability":frame["arguments"]["capability"],
             "duration":frame["arguments"]["duration"],"granted":true});
-        if matches!(expected["capability"].as_str(),Some("admin_command"|"user_command")) && outcome["data"]["unattended"]==true {
+        if matches!(expected["capability"].as_str(),Some("admin_command"|"user_command"|"elevated_user_command")) && outcome["data"]["unattended"]==true {
             expected["unattended"]=json!(true);
         }
         if outcome["data"]!=expected {return Err("PERMISSION_RESULT_BINDING_MISMATCH".into());}

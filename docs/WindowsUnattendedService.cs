@@ -134,7 +134,7 @@ internal sealed class DesktopService : ServiceBase
                 var duration=(string)request["duration"];
                 object requestedCapability;
                 string capability=request.TryGetValue("capability",out requestedCapability)?requestedCapability as string:"admin_command";
-                if(capability!="admin_command" && capability!="user_command") {Thread.Sleep(250);continue;}
+                if(capability!="admin_command" && capability!="user_command" && capability!="elevated_user_command") {Thread.Sleep(250);continue;}
                 long remaining=Convert.ToInt64(request["expires_at"])-Now();
                 Guid requestId;
                 if(id==lastRequest || remaining<=0 || remaining>120 ||
@@ -159,8 +159,13 @@ internal sealed class DesktopService : ServiceBase
                 uint session=WTSGetActiveConsoleSessionId();
                 if(!SessionBelongsTo(session,config["ownerSid"])) {Thread.Sleep(250);continue;}
                 bool userContext=capability=="user_command";
-                string title=userContext?"Desktop MCP: user account access":"Desktop MCP: unattended administrator access";
-                string message=userContext
+                bool elevatedUser=capability=="elevated_user_command";
+                string title=elevatedUser?"Desktop MCP: elevated user account access":userContext?"Desktop MCP: user account access":"Desktop MCP: unattended administrator access";
+                string message=elevatedUser
+                    ?"Your paired ChatGPT controller requests elevated administrator command access in your signed-in Windows account "+time+".\n\n"
+                    +"This allows administrative actions and access to your user profile. It uses your administrator token, only while your account is signed in. "
+                    +"Use the Desktop MCP revoke shortcut to end access.\n\nAllow this request?"
+                    :userContext
                     ?"Your paired ChatGPT controller requests standard-user command access to your signed-in Windows account "+time+".\n\n"
                     +"This includes access to your user files, development tools and connected network drives. No SYSTEM elevation is granted by this permission. "
                     +"Use the Desktop MCP revoke shortcut to end access.\n\nAllow this request?"
@@ -627,6 +632,8 @@ internal sealed class DesktopService : ServiceBase
         if(File.Exists(Grant))File.Delete(Grant);
         string userGrant=Path.Combine(DataRoot,"user-grant.json");
         if(File.Exists(userGrant))File.Delete(userGrant);
+        string elevatedUserGrant=Path.Combine(DataRoot,"elevated-user-grant.json");
+        if(File.Exists(elevatedUserGrant))File.Delete(elevatedUserGrant);
         File.AppendAllText(Path.Combine(DataRoot,"owner-grants.jsonl"),
             new JavaScriptSerializer().Serialize(new {at=Now(),event_type="revoke"})+"\n");
         // The runtime checks the owner grant for every command and interrupts active commands on revocation.

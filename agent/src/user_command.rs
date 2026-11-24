@@ -4,16 +4,18 @@
 use serde_json::{json, Value};
 pub const TOOL:&str="user_command";
 pub const RESULT:&str="user_command_result";
+pub const ELEVATED:&str="elevated_user_command";
+pub const ELEVATED_RESULT:&str="elevated_user_command_result";
 
 #[cfg(windows)]
 mod platform {
     use super::*;
     use std::{ffi::c_void, io::{Read,Write,BufRead,BufReader}, net::{TcpListener,TcpStream,Ipv4Addr,SocketAddrV4},
-        os::windows::{ffi::OsStrExt,process::CommandExt}, path::Path, process::{Command,Stdio},
+        os::windows::{ffi::OsStrExt,process::CommandExt,io::{OwnedHandle,FromRawHandle}}, path::Path, process::{Command,Stdio},
         ptr::{null,null_mut}, thread, time::{Duration,Instant}};
     use windows_sys::Win32::{
         Foundation::{HANDLE,CloseHandle,LocalFree,WAIT_OBJECT_0},
-        Security::{GetTokenInformation,TokenUser,TokenElevation,TOKEN_USER,TOKEN_ELEVATION,EqualSid,PSID,
+        Security::{GetTokenInformation,TokenUser,TokenElevation,TokenLinkedToken,TOKEN_LINKED_TOKEN,TOKEN_USER,TOKEN_ELEVATION,EqualSid,PSID,
             Authorization::ConvertStringSidToSidW},
         System::{
             Environment::{CreateEnvironmentBlock,DestroyEnvironmentBlock},
@@ -30,7 +32,7 @@ mod platform {
     struct Environment(*mut c_void);
     impl Drop for Environment {fn drop(&mut self){unsafe{DestroyEnvironmentBlock(self.0);}}}
     fn wide(s:&std::ffi::OsStr)->Vec<u16>{s.encode_wide().chain(Some(0)).collect()}
-    fn owner_token(owner:&str)->Result<Handle,String>{
+    fn owner_token(owner:&str,want_elevated:bool)->Result<Handle,String>{
         let mut raw=null_mut();
         let session=unsafe{WTSGetActiveConsoleSessionId()};
         if session==u32::MAX || unsafe{WTSQueryUserToken(session,&mut raw)}==0 {
@@ -55,13 +57,36 @@ mod platform {
         if !matches {return Err("OWNER_SESSION_MISMATCH".into());}
         let mut elevated=TOKEN_ELEVATION::default();
         if unsafe{GetTokenInformation(token.0,TokenElevation,(&mut elevated as *mut TOKEN_ELEVATION).cast(),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,&mut size)}==0 || elevated.TokenIsElevated!=0 {
-            return Err("NON_ELEVATED_OWNER_TOKEN_REQUIRED".into());
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,&mut size)}==0 {
+            return Err("OWNER_TOKEN_INVALID".into());
         }
-        Ok(token)
+        if (elevated.TokenIsElevated!=0)==want_elevated {return Ok(token);}
+        if !want_elevated {return Err("NON_ELEVATED_OWNER_TOKEN_REQUIRED".into());}
+        // Only the already elevated, protected SYSTEM broker reaches this path,
+        // after a distinct, explicit owner-approved elevated-user grant.
+        // Never manufacture a token for a standard user or select another SID.
+        let mut linked=TOKEN_LINKED_TOKEN::default();
+        if unsafe{GetTokenInformation(token.0,TokenLinkedToken,(&mut linked as *mut TOKEN_LINKED_TOKEN).cast(),
+            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,&mut size)}==0 || linked.LinkedToken.is_null() {
+            return Err("OWNER_ELEVATED_TOKEN_UNAVAILABLE".into());
+        }
+        let linked=Handle(linked.LinkedToken);
+        if unsafe{GetTokenInformation(linked.0,TokenElevation,(&mut elevated as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,&mut size)}==0 || elevated.TokenIsElevated==0 {
+            return Err("OWNER_ELEVATED_TOKEN_UNAVAILABLE".into());
+        }
+        let mut size=0u32;
+        unsafe{GetTokenInformation(linked.0,TokenUser,null_mut(),0,&mut size);}
+        if size==0 || size>16384 {return Err("OWNER_TOKEN_INVALID".into());}
+        let mut linked_data=vec![0usize;(size as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe{GetTokenInformation(linked.0,TokenUser,linked_data.as_mut_ptr().cast(),size,&mut size)}==0 ||
+            unsafe{EqualSid(user.User.Sid,(*(linked_data.as_ptr().cast::<TOKEN_USER>())).User.Sid)}==0 {
+            return Err("OWNER_SESSION_MISMATCH".into());
+        }
+        Ok(linked)
     }
-    fn launch(owner:&str,port:u16,nonce:&str)->Result<(Handle,Handle),String>{
-        let token=owner_token(owner)?;
+    fn launch(owner:&str,port:u16,nonce:&str,elevated:bool,terminal:bool)->Result<(Handle,Handle),String>{
+        let token=owner_token(owner,elevated)?;
         let mut profile=vec![0u16;32768];let mut size=profile.len() as u32;
         if unsafe{GetUserProfileDirectoryW(token.0,profile.as_mut_ptr(),&mut size)}==0 {
             return Err("OWNER_PROFILE_UNAVAILABLE".into());
@@ -72,7 +97,7 @@ mod platform {
         let exe=std::env::current_exe().map_err(|_|"WORKER_BINARY_UNAVAILABLE")?;
         let exe_w=wide(exe.as_os_str());
         let mut line:Vec<u16>="\"".encode_utf16().chain(exe.as_os_str().encode_wide())
-            .chain(format!("\" --user-command-worker {port} {nonce}").encode_utf16()).chain(Some(0)).collect();
+            .chain(format!("\" {} {port} {nonce}",if terminal {"--user-terminal-worker"}else{"--user-command-worker"}).encode_utf16()).chain(Some(0)).collect();
         let mut info=STARTUPINFOW::default();info.cb=std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut pi=PROCESS_INFORMATION::default();
         let job=Handle(unsafe{CreateJobObjectW(null(),null())});
@@ -112,7 +137,7 @@ mod platform {
         }
         Err("COMMAND_CANCELED_OR_EXPIRED".into())
     }
-    pub fn run(command:&str,state:&Path,active:impl Fn()->bool)->Result<Value,String>{
+    pub fn run(command:&str,state:&Path,elevated:bool,active:impl Fn()->bool)->Result<Value,String>{
         if !active(){return Err("GRANT_REVOKED".into());}
         let cfg:Value=serde_json::from_slice(&std::fs::read(state.parent().ok_or("MACHINE_STATE_MISSING")?.join("gateway.json"))
             .map_err(|_|"OWNER_CONFIGURATION_MISSING")?).map_err(|_|"OWNER_CONFIGURATION_INVALID")?;
@@ -121,7 +146,7 @@ mod platform {
         listener.set_nonblocking(true).map_err(|_|"WORKER_BIND_FAILED")?;
         let nonce=format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
         let port=listener.local_addr().map_err(|_|"WORKER_BIND_FAILED")?.port();
-        let (process,_job)=launch(owner,port,&nonce)?;
+        let (process,_job)=launch(owner,port,&nonce,elevated,false)?;
         let deadline=Instant::now()+Duration::from_secs(8);
         let mut stream=loop {
             if !active(){return Err("COMMAND_CANCELED_OR_EXPIRED".into());}
@@ -150,6 +175,82 @@ mod platform {
             Ok(result)
         }else{Err("WORKER_RESPONSE_INVALID".into())}
     }
+    pub struct TerminalShell {
+        pub process:OwnedHandle,
+        pub job:OwnedHandle,
+        pub input:TcpStream,
+        pub output:TcpStream,
+        pub error:TcpStream,
+    }
+    fn owned(handle:Handle)->OwnedHandle {
+        let handle=std::mem::ManuallyDrop::new(handle);
+        unsafe{OwnedHandle::from_raw_handle(handle.0)}
+    }
+    pub fn terminal_shell(state:&Path,elevated:bool)->Result<TerminalShell,String>{
+        let cfg:Value=serde_json::from_slice(&std::fs::read(state.parent().ok_or("MACHINE_STATE_MISSING")?.join("gateway.json"))
+            .map_err(|_|"OWNER_CONFIGURATION_MISSING")?).map_err(|_|"OWNER_CONFIGURATION_INVALID")?;
+        let owner=cfg["ownerSid"].as_str().ok_or("OWNER_CONFIGURATION_INVALID")?;
+        let listener=TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST,0)).map_err(|_|"WORKER_BIND_FAILED")?;
+        listener.set_nonblocking(true).map_err(|_|"WORKER_BIND_FAILED")?;
+        let nonce=format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
+        let port=listener.local_addr().map_err(|_|"WORKER_BIND_FAILED")?.port();
+        let (process,job)=launch(owner,port,&nonce,elevated,true)?;
+        let deadline=Instant::now()+Duration::from_secs(6);
+        let mut main=None;let mut error=None;
+        while main.is_none() || error.is_none() {
+            if Instant::now()>=deadline || unsafe{WaitForSingleObject(process.0,0)}==WAIT_OBJECT_0 {
+                return Err("OWNER_TERMINAL_OFFLINE".into());
+            }
+            let (mut s,_)=match listener.accept(){
+                Ok(v)=>v,
+                Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{thread::sleep(Duration::from_millis(20));continue;},
+                Err(_)=>return Err("WORKER_ACCEPT_FAILED".into())
+            };
+            s.set_nonblocking(false).map_err(|_|"WORKER_IO")?;
+            s.set_read_timeout(Some(Duration::from_millis(500))).map_err(|_|"WORKER_IO")?;
+            let mut hello=[0u8;65];
+            if s.read_exact(&mut hello).is_err() || &hello[..64]!=nonce.as_bytes(){continue;}
+            s.set_read_timeout(None).map_err(|_|"WORKER_IO")?;
+            s.set_write_timeout(Some(Duration::from_secs(3))).map_err(|_|"WORKER_IO")?;
+            match hello[64] {
+                b'O' if main.is_none()=>main=Some(s),
+                b'E' if error.is_none()=>error=Some(s),
+                _=>return Err("OWNER_TERMINAL_AUTH_FAILED".into())
+            }
+        }
+        let output=main.unwrap();
+        let input=output.try_clone().map_err(|_|"WORKER_IO")?;
+        Ok(TerminalShell{process:owned(process),job:owned(job),input,output,error:error.unwrap()})
+    }
+    pub fn terminal_worker(port:u16,nonce:&str)->Result<(),String>{
+        if nonce.len()!=64 || !nonce.bytes().all(|b|b.is_ascii_hexdigit()) {return Err("WORKER_AUTH_INVALID".into());}
+        let connect=|role:u8|->Result<TcpStream,String>{
+            let mut stream=TcpStream::connect_timeout(&SocketAddrV4::new(Ipv4Addr::LOCALHOST,port).into(),Duration::from_secs(3))
+                .map_err(|_|"WORKER_CONNECT_FAILED")?;
+            stream.set_write_timeout(Some(Duration::from_secs(8))).map_err(|_|"WORKER_IO")?;
+            let mut hello=nonce.as_bytes().to_vec();hello.push(role);
+            stream.write_all(&hello).map_err(|_|"WORKER_IO")?;
+            Ok(stream)
+        };
+        let mut output=connect(b'O')?;let mut error=connect(b'E')?;
+        let mut input=output.try_clone().map_err(|_|"WORKER_IO")?;
+        let powershell=Path::new(&std::env::var_os("SystemRoot").ok_or("SYSTEM_ROOT_MISSING")?)
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let encoded=crate::unattended::base64_encode(&crate::terminal::BOOTSTRAP.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+        let mut child=Command::new(powershell).args(["-NoLogo","-NoProfile","-NonInteractive","-EncodedCommand",&encoded])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(CREATE_NO_WINDOW)
+            .spawn().map_err(|_|"SHELL_UNAVAILABLE")?;
+        let mut stdin=child.stdin.take().ok_or("WORKER_PIPE_FAILED")?;
+        let mut stdout=child.stdout.take().ok_or("WORKER_PIPE_FAILED")?;
+        let mut stderr=child.stderr.take().ok_or("WORKER_PIPE_FAILED")?;
+        let _input=thread::spawn(move||std::io::copy(&mut input,&mut stdin));
+        let out=thread::spawn(move||std::io::copy(&mut stdout,&mut output));
+        let err=thread::spawn(move||std::io::copy(&mut stderr,&mut error));
+        child.wait().map_err(|_|"SHELL_EXIT_FAILED")?;
+        let _=out.join();let _=err.join();
+        Ok(())
+    }
+
     pub fn worker(port:u16,nonce:&str)->Result<(),String>{
         if nonce.len()!=64 || !nonce.bytes().all(|b|b.is_ascii_hexdigit()) {return Err("WORKER_AUTH_INVALID".into());}
         let mut stream=TcpStream::connect_timeout(&SocketAddrV4::new(Ipv4Addr::LOCALHOST,port).into(),Duration::from_secs(3))
@@ -179,4 +280,4 @@ mod platform {
         response.push(b'\n');stream.write_all(&response).map_err(|_|"WORKER_IO".to_string())
     }
 }
-#[cfg(windows)]pub use platform::{run,worker};
+#[cfg(windows)]pub use platform::{run,worker,terminal_shell,terminal_worker};
