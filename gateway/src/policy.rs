@@ -97,7 +97,7 @@ impl PolicyFile {
             if host.host_id.len()!=32||!host.host_id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err("INVALID_POLICY_HOST_ID".into())
             }
-            if host.workspace_id!="default"||host.tools.len()>12 {
+            if host.workspace_id!="default"||host.tools.len()>14 {
                 return Err("INVALID_POLICY_WORKSPACE_OR_TOOLS".into())
             }
             if !unique.insert((host.host_id.as_str(),host.workspace_id.as_str())) {
