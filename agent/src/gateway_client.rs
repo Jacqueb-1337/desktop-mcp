@@ -192,7 +192,9 @@ if route_enabled {
             }));
         }
         if ack.get("route").is_none() && pending.active.is_empty() {
-            thread::sleep(Duration::from_secs(4));
+            // Executable gateways already long-poll their request queue.
+            // Retain a bounded idle backoff for old/identity-only peers.
+            thread::sleep(if exec_enabled {Duration::from_millis(200)} else {Duration::from_secs(4)});
         }
     }
 }

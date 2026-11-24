@@ -341,7 +341,7 @@ fn host_allowed(path:&Path,host:&str,broker:Option<&broker::Broker>)->Result<boo
 
 // One authenticated connection carries bounded, request-bound routes. Each
 // heartbeat advances one route; a sleeping command cannot block new routes.
-fn mux_heartbeat(tls:&mut StreamOwned<ServerConnection,TcpStream>,
+fn mux_heartbeat(tls:&mut (impl Read+Write),
     requests:&std::sync::mpsc::Receiver<broker::Job>, pending:&mut VecDeque<broker::Job>,
     allowlist:&Path,host:&str,broker:&broker::Broker)->Result<(),String> {
     use std::sync::atomic::Ordering;
@@ -525,7 +525,7 @@ fn run() -> Result<(), String> {
             "--target-host"=>target_host=args.next(),
             "--allow-lan"=>allow_lan=true,
             "--once"=>once=true,
-            "--version"=>{println!("desktop-mcp-gateway 0.1.0");return Ok(())},
+            "--version"=>{println!("desktop-mcp-gateway {}",env!("CARGO_PKG_VERSION"));return Ok(())},
             _=>return Err(format!("UNKNOWN_ARGUMENT: {arg}")),
         }
     }
@@ -676,6 +676,70 @@ mod tests {
         assert_eq!(verify_claim(&claim,&nonce,&allow).unwrap(),id);
         assert!(verify_claim(&claim,&"02".repeat(32),&allow).is_err());
         assert!(verify_claim(&claim,&nonce,&HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn multiplex_scheduler_starts_four_jobs_before_poll_and_rejects_canceled_work(){
+        use std::sync::{mpsc,atomic::{AtomicBool,Ordering}};
+        #[cfg(windows)] let state=tempfile::tempdir_in(std::env::var_os("USERPROFILE").unwrap()).unwrap();
+        #[cfg(not(windows))] let state=tempfile::tempdir().unwrap();
+        let key=SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let host=host_fingerprint(&key);
+        let allowlist=state.path().join("allowlist.json");
+        fs::write(&allowlist,serde_json::to_vec(&json!({"version":1,"hosts":[
+            {"host_id":host,"public_key":hex::encode(key)}]})).unwrap()).unwrap();
+        let policy=policy::PolicyFile{version:1,hosts:vec![policy::HostScope{
+            host_id:host.clone(),workspace_id:"default".into(),tools:vec!["git_status".into()]}]};
+        let broker=broker::Broker::new(policy,audit::Audit::open(state.path()).unwrap(),state.path()).unwrap();
+        let (tx,rx)=mpsc::sync_channel(4);
+        let mut pending=VecDeque::new();
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut frames=Vec::new();
+        let mut outcomes=Vec::new();
+        let mut cancels=Vec::new();
+        for _ in 0..4{
+            let id=uuid::Uuid::new_v4().to_string();
+            let intent=policy::Intent{request_id:id.clone(),target_host_id:host.clone(),
+                workspace_id:"default".into(),tool:"git_status".into()};
+            let frame=json!({"type":"route_intent","version":2,"request_id":id,
+                "target_host_id":host,"workspace_id":"default","tool":"git_status",
+                "arguments":{},"expires_at":now+60,"nonce":"01".repeat(32)});
+            let (response,outcome)=mpsc::sync_channel(1);
+            let canceled=Arc::new(AtomicBool::new(false));
+            tx.send(broker::Job{intent,frame:frame.clone(),response,canceled:canceled.clone()}).unwrap();
+            frames.push(frame);outcomes.push(outcome);cancels.push(canceled);
+        }
+        // The fake peer returns fixed synthetic protocol replies; it never runs tools.
+        struct Peer {input:std::io::Cursor<Vec<u8>>,output:Vec<u8>}
+        impl Read for Peer {fn read(&mut self,b:&mut [u8])->std::io::Result<usize>{self.input.read(b)}}
+        impl Write for Peer {fn write(&mut self,b:&[u8])->std::io::Result<usize>{self.output.write(b)}
+            fn flush(&mut self)->std::io::Result<()>{Ok(())}}
+        let step=|reply:Value,queue:&mut VecDeque<broker::Job>|{
+            let mut input=Vec::new();send_json(&mut input,&reply).unwrap();
+            let mut peer=Peer{input:std::io::Cursor::new(input),output:Vec::new()};
+            mux_heartbeat(&mut peer,&rx,queue,&allowlist,&host,&broker).unwrap();
+            read_json(&mut peer.output.as_slice()).unwrap()["mux"].clone()
+        };
+        for (i,frame) in frames.iter().enumerate(){
+            let reply=json!({"type":"route_pending","version":2,"request_hash":broker::digest(frame)});
+            let msg=step(reply,&mut pending);
+            assert_eq!(msg["op"],"start");assert_eq!(msg["frame"],*frame);
+            assert_eq!(pending.len(),i+1);
+        }
+        cancels[2].store(true,Ordering::SeqCst);
+        let canceled=step(json!({"type":"route_cancelled","version":2,
+            "request_hash":broker::digest(&frames[2])}),&mut pending);
+        assert_eq!(canceled["op"],"cancel");assert_eq!(canceled["frame"],frames[2]);
+        assert_eq!(outcomes[2].try_recv().unwrap().unwrap_err(),"ROUTE_CANCELED_EXPIRED_OR_REVOKED");
+        for i in [0,1,3] {
+            let frame=&frames[i];
+            let reply=json!({"type":"route_result","version":2,"request_id":frame["request_id"],
+                "target_host_id":host,"nonce":frame["nonce"],"request_hash":broker::digest(frame),
+                "outcome":{"pending":false,"executed":true,"data":{"simulated":true}}});
+            let msg=step(reply,&mut pending);assert_eq!(msg["op"],"poll");assert_eq!(msg["frame"],*frame);
+            assert_eq!(outcomes[i].try_recv().unwrap().unwrap()["outcome"]["data"]["simulated"],true);
+        }
+        assert!(pending.is_empty());
     }
 
     #[test]

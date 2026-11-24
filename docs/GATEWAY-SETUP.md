@@ -101,3 +101,16 @@ Unsupported versions and malformed policies fail closed. A legacy policy
 with fewer capabilities remains valid; its existing authorization choices
 are preserved. Capability changes are separate from binary deployment and
 must remain subject to the administrator's established approval process.
+
+The binary-only maintenance helper, `gateway_binary_upgrade.py`, performs
+checksum verification, offline compatibility review, a same-directory
+atomic binary replacement, a verified backup, and a systemd restart check.
+On detected failure after replacement it restores the previous binary and
+restarts the service. It never writes policy, pairing, keys or grant files.
+This is not a policy migration utility. The operator must independently
+verify the candidate provenance and use the existing administrative process
+for authorization changes. A service-active check is not proof of remote
+connectivity; verify device reconnection after a successful upgrade.
+Sudden power loss and live Linux service recovery are not covered by the
+disposable test suite. Run the latter with
+`python -B -m unittest discover -s docs -p test_gateway_binary_upgrade.py`.
