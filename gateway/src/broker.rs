@@ -281,6 +281,8 @@ impl Broker {
         let frame = json!({"type":"route_intent","version":2,"request_id":intent.request_id,"target_host_id":host,"workspace_id":"default","tool":tool,"arguments":arguments,"expires_at":expires,"nonce":hex::encode(nonce)});
         let (response, rx) = mpsc::sync_channel(1);
         let canceled = Arc::new(AtomicBool::new(false));
+        // Operational timing only: never log command text or arguments.
+        eprintln!("ROUTE_RECEIVED id={} tool={}",intent.request_id,intent.tool);
         tx.try_send(Job {
             intent,
             frame,

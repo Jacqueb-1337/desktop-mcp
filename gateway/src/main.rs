@@ -290,6 +290,7 @@ fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf,
         println!("ROUTE_REQUIRES_LOCAL_APPROVAL {}",job.intent.request_id);
     }
     let mut mux_pending=VecDeque::new();
+    let mut last_mux_mode=None;
     loop {
         let heartbeat = read_json(&mut tls)?;
         // An updated allowlist takes effect on the next heartbeat.
@@ -306,7 +307,12 @@ fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf,
                 info.connected_seconds=now.elapsed().as_secs();
             }
         }
-        if exec_enabled && heartbeat["route_mux_v1"]==true {
+        let multiplexed=exec_enabled && heartbeat["route_mux_v1"]==true;
+        if last_mux_mode!=Some(multiplexed) {
+            eprintln!("ROUTE_MODE {}",if multiplexed {"multiplexed"} else {"legacy"});
+            last_mux_mode=Some(multiplexed);
+        }
+        if multiplexed {
             mux_heartbeat(&mut tls,requests.as_ref().ok_or("BROKER_REQUIRED")?,
                 &mut mux_pending,&allowlist_path,&id,broker.as_deref().ok_or("BROKER_REQUIRED")?)?;
             continue;
@@ -325,6 +331,7 @@ fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf,
             let reserved=broker.audit.lock().map_err(|_|"AUDIT_LOCK_POISONED")?.reserve_bound(&job.intent,&id,&job.frame);
             if reserved.is_err(){let _=job.response.send(Err("REQUEST_REPLAYED_OR_AUDIT_UNAVAILABLE".into()));send_json(&mut tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}))?;continue;}
             send_json(&mut tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false,"route":job.frame}))?;
+            eprintln!("ROUTE_DISPATCH id={} mode=legacy",job.intent.request_id);
             let result=run_scoped_route(&mut tls,&job,&allowlist_path,&id,broker);
             if result.is_ok(){broker.audit.lock().map_err(|_|"AUDIT_LOCK_POISONED")?.record_completion(&job.intent,&id)?;}
             let failed=result.is_err();let _=job.response.send(result);
@@ -375,6 +382,7 @@ fn mux_heartbeat(tls:&mut (impl Read+Write),
             return send_json(tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}));
         }
     }
+    if op=="start" {eprintln!("ROUTE_DISPATCH id={} mode=multiplexed",job.intent.request_id);}
     send_json(tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false,"mux":{"op":op,"frame":job.frame}}))?;
     let response=read_json(tls)?;
     let hash=broker::digest(&job.frame);
