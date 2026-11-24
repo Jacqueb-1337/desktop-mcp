@@ -1,6 +1,6 @@
-# Desktop MCP Windows in-place upgrade (development branch)
+# Desktop MCP Windows in-place upgrade
 
-**Status:** Implemented in `feat/transactional-windows-upgrade`, not yet in the published v0.3.2 release. Run the upgrade only from an installer built from this branch after reviewing the notes.
+Version 0.3.3 includes the in-place Windows updater.
 
 ## Installer behavior
 
@@ -19,8 +19,7 @@ original scheduled tasks.
   Task definitions and their registered owners are never rewritten.
 - If the gateway TLS CA already exists, its fingerprint must match the bundle.
   A changed CA cannot be installed silently.
-- If migrating an old local-only installation without a saved public gateway
-  endpoint, the setup asks **once**, saves that value, and removes it on failure.
+- Existing direct-route installations can update their binaries without entering a WireGuard endpoint. The updater verifies the existing gateway address, TLS name and CA, keeps the original route-pinned supervisor, and updates its agent.
 - When the protected SYSTEM service exists, the upgrade requires one fresh
   Windows UAC approval. It checks the existing owner, matching signing key,
   private TLS server address and CA, and pinned WireGuard server public key.

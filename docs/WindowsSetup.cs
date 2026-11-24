@@ -81,11 +81,6 @@ internal static class WindowsSetup
                     "\n\nThe updater will preserve your configuration and restore old binaries if a step fails.",
                     "Upgrade Desktop MCP", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
                     MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
-                if (endpoint == null)
-                {
-                    endpoint = GatewayEndpoint.Prompt();
-                    if (endpoint == null) return;
-                }
                 bool machineInstalled = File.Exists(Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
                     "DesktopMCP", "DesktopMCPService.exe"));
@@ -100,7 +95,14 @@ internal static class WindowsSetup
                         "Desktop MCP protected service", MessageBoxButtons.YesNo,
                         MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
                 {
-                    try { ElevateProtectedService(state, false); }
+                    try {
+                        if(endpoint==null) {
+                            endpoint=GatewayEndpoint.Prompt();
+                            if(endpoint==null)return;
+                            endpoint.SaveNew(state);
+                        }
+                        ElevateProtectedService(state, false);
+                    }
                     catch(Exception optionalError)
                     {
                         MessageBox.Show("The local upgrade succeeded, but the optional protected " +

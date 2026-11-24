@@ -145,8 +145,7 @@ internal static class WindowsInPlaceUpgrade
         GatewayEndpoint saved=GatewayEndpoint.Load(state);
         if(saved!=null && chosenEndpoint!=null && saved.Display!=chosenEndpoint.Display)
             throw new InvalidOperationException("Saved gateway endpoint must never be silently changed.");
-        if(saved==null && chosenEndpoint==null)
-            throw new InvalidOperationException("Gateway address is required to migrate this installation.");
+
 
         // A different CA cannot be silently introduced on upgrade.
         byte[] ca=Bundled("gateway-ca");
@@ -174,7 +173,7 @@ internal static class WindowsInPlaceUpgrade
             tx.Stage("desktop-mcp.exe",Bundled("tray"),false);
             if(!File.Exists(caPath))tx.Stage("nas-ca.pem",ca,true);
             // Stage and verify every payload before any process is stopped.
-            if(saved==null)
+            if(saved==null && chosenEndpoint!=null)
             {
                 chosenEndpoint.SaveNew(state);
                 endpointCreated=true;

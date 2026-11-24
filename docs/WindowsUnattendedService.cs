@@ -392,7 +392,12 @@ internal sealed class DesktopService : ServiceBase
         byte[] caBytes=ReadEmbeddedResource("gateway-ca");
         if(!EqualBytes(Hash(caBytes),Hash(File.ReadAllBytes(Ca))))
             throw new InvalidDataException("Gateway TLS CA differs. Reprovision trust explicitly.");
-        using(var cfg=Assembly.GetExecutingAssembly().GetManifestResourceStream("gateway"))
+        var installed=Assembly.Load(File.ReadAllBytes(ServiceExe));
+        bool direct=Array.IndexOf(installed.GetManifestResourceNames(),"gateway-wg-public")<0;
+        if(direct && WireGuardTunnelInstaller.TunnelServiceExists())
+            throw new InvalidDataException("Existing WireGuard service has no verifiable pin.");
+        var routeSource=direct ? installed : Assembly.GetExecutingAssembly();
+        using(var cfg=routeSource.GetManifestResourceStream("gateway"))
         using(var reader=new StreamReader(cfg))
             if(reader.ReadLine()!=config["address"] || reader.ReadLine()!=config["tlsName"])
                 throw new InvalidDataException("Gateway TLS address differs. Refusing silent redirection.");
@@ -401,7 +406,7 @@ internal sealed class DesktopService : ServiceBase
         // installation. Compare the PUBLIC key inside the previously installed,
         // administrator-protected service, rather than assuming the original .conf
         // is still available. Do not open or re-create private tunnel keys.
-        if(!String.Equals(ReadInstalledGatewayPublicKey(),trustedKey,StringComparison.Ordinal))
+        if(!direct && !String.Equals(ReadInstalledGatewayPublicKey(),trustedKey,StringComparison.Ordinal))
             throw new InvalidDataException("Pinned WireGuard server identity differs. Reprovision manually.");
         string tunnel=Path.Combine(DataRoot,"WireGuard",WireGuardProvisioning.ConfigName);
         if(File.Exists(tunnel))
@@ -410,7 +415,7 @@ internal sealed class DesktopService : ServiceBase
             if(!File.ReadAllText(tunnel).Contains("PublicKey = "+trustedKey))
                 throw new InvalidDataException("Installed WireGuard configuration has a different server key.");
         }
-        else if(!WireGuardTunnelInstaller.TunnelServiceExists())
+        else if(!direct && !WireGuardTunnelInstaller.TunnelServiceExists())
             throw new InvalidDataException("Existing WireGuard tunnel service is missing.");
 
         using(var service=new ServiceController(Name))
@@ -422,7 +427,8 @@ internal sealed class DesktopService : ServiceBase
             try
             {
                 tx.Stage(Path.GetFileName(Agent),ReadEmbeddedResource("agent"),false);
-                tx.Stage(Path.GetFileName(ServiceExe),File.ReadAllBytes(Assembly.GetExecutingAssembly().Location),false);
+                // Preserve the supervisor that pins the original direct-route profile.
+                if(!direct)tx.Stage(Path.GetFileName(ServiceExe),File.ReadAllBytes(Assembly.GetExecutingAssembly().Location),false);
                 service.Stop();
                 service.WaitForStatus(ServiceControllerStatus.Stopped,TimeSpan.FromSeconds(20));
                 tx.Apply();
