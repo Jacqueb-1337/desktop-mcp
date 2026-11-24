@@ -64,6 +64,19 @@ def main():
                 elapsed,result = ask(q)
                 print("text_ms",round(elapsed,2),"scope",scope,"matches",len(result["results"]),
                       "budget_exhausted",result["scan_budget_exhausted"])
+            q={"mode":"text","pattern":"needle_unique","engine":"fff"}
+            cold,result=ask(q)
+            print("fff_cold_ms",round(cold,2),"ready",result.get("content_index_ready"),"matches",len(result["results"]),"budget_exhausted",result["scan_budget_exhausted"])
+            warm,result=ask(q)
+            print("fff_warm_ms",round(warm,2),"ready",result.get("content_index_ready"),"matches",len(result["results"]),"prefiltered",result.get("prefiltered_files"),"budget_exhausted",result["scan_budget_exhausted"])
+            try:
+                import psutil
+                print("fff_worker_rss_mib",round(psutil.Process(session.pid).memory_info().rss/1048576,2))
+            except ImportError:
+                pass
+            q={"mode":"paths","pattern":"sorce0099","engine":"fff","limit":1}
+            elapsed,result=ask(q)
+            print("fff_fuzzy_ms",round(elapsed,2),"result",result["results"][:1])
         finally:
             session.terminate()
             session.wait(timeout=5)

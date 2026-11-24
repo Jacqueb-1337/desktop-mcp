@@ -193,7 +193,8 @@ fn search_schema()->Value {
                 "scope":{"type":"string","description":"Repository-relative file or directory"},
                 "exclude":{"type":"array","maxItems":32,"items":{"type":"string"},"description":"Repository-relative path prefixes to exclude"},
                 "context":{"type":"integer","minimum":0,"maximum":3},"offset":{"type":"integer","minimum":0,"maximum":20000},
-                "refresh":{"type":"boolean","description":"Force a fresh filename index"}},
+                "refresh":{"type":"boolean","description":"Force a fresh search index"},
+                "engine":{"enum":["native","fff"],"description":"Native exact/regex or FFF fuzzy paths and indexed text"}},
         "required":["mode","pattern"]});
     v["required"].as_array_mut().unwrap().push(json!("query"));
     v

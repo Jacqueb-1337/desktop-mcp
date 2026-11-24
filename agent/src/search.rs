@@ -24,6 +24,8 @@ pub struct Query {
     offset: usize,
     #[serde(default)]
     refresh: bool,
+    #[serde(default)]
+    engine: Option<String>,
 }
 fn default_limit() -> usize { 100 }
 pub fn valid_query(value: &Value) -> bool {
@@ -33,7 +35,7 @@ pub fn valid_query(value: &Value) -> bool {
         !q.pattern.contains('\0') && (1..=200).contains(&q.limit) &&
         q.scope.as_deref().is_none_or(crate::readonly::valid_read_path) &&
         q.exclude.len()<=32 && q.exclude.iter().all(|p|crate::readonly::valid_read_path(p)) &&
-        q.context<=3 && q.offset<=20000)
+        q.context<=3 && q.offset<=20000 && q.engine.as_deref().is_none_or(|s|matches!(s,"native"|"fff")))
 }
 
 use notify::{Watcher, RecursiveMode, RecommendedWatcher};
@@ -46,6 +48,7 @@ const MAX_INDEX_ENTRIES:usize=100_000;
 
 struct Snapshot {
     scope:Option<String>, exclude:Vec<String>, paths:Vec<String>, built:Instant, skipped:usize,
+    content_index:Option<FffIndex>,
 }
 pub struct SearchCache {
     watcher:Option<RecommendedWatcher>,
@@ -95,11 +98,12 @@ impl SearchCache {
             .size_limit(1024*1024).build().map_err(|_|"INVALID_SEARCH_REGEX")?;
         let started=Instant::now();
         let deadline=started+Duration::from_secs(4);
-        if q.mode=="paths" {
+        if q.mode=="paths" || q.engine.as_deref()==Some("fff") {
             let invalidated=self.dirty.swap(false,Ordering::AcqRel);
             let reusable=!q.refresh && !invalidated && self.watcher.is_some() &&
                 self.snapshot.as_ref().is_some_and(|s|s.scope==q.scope && s.exclude==q.exclude && s.built.elapsed()<INDEX_TTL);
             if !reusable {
+                self.snapshot=None;
                 self.start_watch(root);
                 #[cfg(not(windows))]
                 let mut watched_dirs=0usize;
@@ -128,13 +132,22 @@ impl SearchCache {
                         _=>{}
                     }
                 }
-                let snapshot=Snapshot{scope:q.scope.clone(),exclude:q.exclude.clone(),paths,built:Instant::now(),skipped};
-                let mut answer=path_results(root,&q,&matcher,&snapshot,false,complete,deadline);
+                let mut snapshot=Snapshot{scope:q.scope.clone(),exclude:q.exclude.clone(),paths,built:Instant::now(),skipped,content_index:None};
+                let mut answer=if q.mode=="paths" {
+                    path_results(root,&q,&matcher,&snapshot,false,complete,deadline)
+                } else {
+                    fff_text(root,&q,&matcher,&mut snapshot,self.pool.as_ref(),false,complete,deadline)?
+                };
                 answer["index_watch_active"]=json!(self.watcher.is_some());
                 self.snapshot=if complete && self.watcher.is_some() && !self.dirty.load(Ordering::Acquire){Some(snapshot)}else{None};
                 return Ok(answer);
             }
-            let mut result=path_results(root,&q,&matcher,self.snapshot.as_ref().unwrap(),true,true,deadline);
+            let snapshot=self.snapshot.as_mut().unwrap();
+            let mut result=if q.mode=="paths" {
+                path_results(root,&q,&matcher,snapshot,true,true,deadline)
+            } else {
+                fff_text(root,&q,&matcher,snapshot,self.pool.as_ref(),true,true,deadline)?
+            };
             result["index_watch_active"]=json!(true);
             result["index_changed_during_query"]=json!(self.dirty.load(Ordering::Acquire));
             // An event observed during the query invalidates the snapshot for the next call.
@@ -241,28 +254,42 @@ fn path_results(root:&Path,q:&Query,matcher:&regex::Regex,s:&Snapshot,cached:boo
     let mut scanned=0usize;
     let mut skipped=s.skipped;
     let mut exhausted=!complete;
-    for path in &s.paths {
+    let order:Vec<usize>=if q.engine.as_deref()==Some("fff") && !q.regex && !q.case_sensitive {
+        let mut matcher=neo_frizbee::Matcher::new(&q.pattern,&neo_frizbee::Config{
+            max_typos:Some((q.pattern.len()/4).clamp(1,3) as u16),..Default::default()
+        });
+        let mut ranked=matcher.match_list(&s.paths);
+        ranked.sort_by(|a,b|b.score.cmp(&a.score).then_with(||a.index.cmp(&b.index)));
+        ranked.into_iter().map(|m|m.index as usize).collect()
+    } else {(0..s.paths.len()).collect()};
+    let fuzzy=q.engine.as_deref()==Some("fff") && !q.regex && !q.case_sensitive;
+    for index in order {
+        let path=&s.paths[index];
         if Instant::now()>=deadline {exhausted=true;break;}
         scanned+=1;
-        if matcher.is_match(path) {
+        if fuzzy || matcher.is_match(path) {
             if cached && !still_regular(root,path){skipped+=1;continue;}
             if !state.add(json!({"path":path}),q){break;}
         }
     }
     let mut result=state.finish(q,scanned,0,skipped,exhausted);
+    result["engine"]=json!(q.engine.as_deref().unwrap_or("native"));
     result["index_hit"]=json!(cached);
     result["index_entries"]=json!(s.paths.len());
     result["index_age_ms"]=json!(s.built.elapsed().as_millis());
     result
 }
-fn scan_file(dir:&cap_std::fs::Dir,path:&str,matcher:&regex::Regex,literal:bool,limit:usize,deadline:Instant)->Option<(String,Vec<usize>)> {
+fn read_search_text(dir:&cap_std::fs::Dir,path:&str,deadline:Instant)->Option<String> {
     if Instant::now()>=deadline{return None;}
     let file=dir.open(path).ok()?;
     if !file.metadata().is_ok_and(|m|m.is_file() && m.len()<=1024*1024){return None;}
     let mut bytes=Vec::new();
     file.take(1024*1024+1).read_to_end(&mut bytes).ok()?;
     if bytes.len()>1024*1024 || bytes.contains(&0){return None;}
-    let content=String::from_utf8(bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
+fn scan_file(dir:&cap_std::fs::Dir,path:&str,matcher:&regex::Regex,literal:bool,limit:usize,deadline:Instant)->Option<(String,Vec<usize>)> {
+    let content=read_search_text(dir,path,deadline)?;
     let mut hits=Vec::new();
     if literal && !matcher.is_match(&content){return Some((content,hits));}
     for (i,line) in content.lines().enumerate() {
@@ -270,6 +297,108 @@ fn scan_file(dir:&cap_std::fs::Dir,path:&str,matcher:&regex::Regex,literal:bool,
         if matcher.is_match(line){hits.push(i);if hits.len()>=limit{break;}}
     }
     Some((content,hits))
+}
+struct FffIndex {
+    filter:fff_search::bigram_filter::BigramFilter,
+    // Files without an indexed ASCII snapshot must always be considered.
+    unfiltered:Vec<bool>,
+    bytes:usize,
+}
+fn build_fff_index(dir:&cap_std::fs::Dir,paths:&[String],pool:Option<&rayon::ThreadPool>,deadline:Instant)->Option<FffIndex>{
+    use fff_search::bigram_filter::BigramIndexBuilder;
+    if paths.is_empty() || paths.len()>20_000{return None;}
+    let builder=BigramIndexBuilder::new(paths.len());
+    let skip=BigramIndexBuilder::new(paths.len());
+    let mut unfiltered=vec![true;paths.len()];
+    let mut bytes=0usize;
+    for (chunk,paths) in paths.chunks(24).enumerate(){
+        if Instant::now()>=deadline{return None;}
+        let read=|p:&String|read_search_text(dir,p,deadline);
+        let texts:Vec<_>=if let Some(pool)=pool {pool.install(||paths.par_iter().map(read).collect())}
+            else {paths.iter().map(read).collect()};
+        for (i,text) in texts.into_iter().enumerate(){
+            if Instant::now()>=deadline{return None;}
+            let Some(text)=text else{continue;};
+            bytes=bytes.saturating_add(text.len());
+            if bytes>64*1024*1024{return None;}
+            if !text.is_ascii() || text.len()<2{continue;}
+            let index=chunk*24+i;
+            builder.add_file_content(&skip,index,text.as_bytes());
+            unfiltered[index]=false;
+        }
+    }
+    if !builder.is_ready(){return None;}
+    let mut filter=builder.compress(Some(0));
+    filter.set_skip_index(skip.compress(Some(0)));
+    Some(FffIndex{filter,unfiltered,bytes})
+}
+fn fff_text(root:&Path,q:&Query,matcher:&regex::Regex,s:&mut Snapshot,pool:Option<&rayon::ThreadPool>,
+    cached:bool,complete:bool,deadline:Instant)->Result<Value,String>{
+    let dir=cap_std::fs::Dir::open_ambient_dir(root,cap_std::ambient_authority()).map_err(|_|"WORKSPACE_UNAVAILABLE")?;
+    let eligible=!q.regex && q.pattern.is_ascii() && q.pattern.len()>=2;
+    let warm=s.content_index.is_some();
+    if eligible && complete && s.content_index.is_none(){
+        s.content_index=build_fff_index(&dir,&s.paths,pool,deadline);
+    }
+    let candidates=if eligible {s.content_index.as_ref().and_then(|i|i.filter.query(q.pattern.as_bytes()))}else{None};
+    let mut state=Page::new(q.offset);
+    let mut scanned=0usize;
+    let mut skipped=s.skipped;
+    let mut bytes=0usize;
+    let mut exhausted=!complete;
+    let mut filtered=0usize;
+    let mut paths=s.paths.iter().enumerate().filter(|(i,_)|{
+        let include=candidates.as_ref().is_none_or(|bits|{
+            s.content_index.as_ref().unwrap().unfiltered[*i] ||
+                fff_search::bigram_filter::BigramFilter::is_candidate(bits,*i)
+        });
+        if !include{filtered+=1;}
+        include
+    });
+    'scan: loop {
+        if Instant::now()>=deadline || bytes>=64*1024*1024 {exhausted=true;break;}
+        let batch:Vec<_>=paths.by_ref().take(24).map(|(_,p)|p).collect();
+        if batch.is_empty(){break;}
+        let read=|p:&&String|scan_file(&dir,p,matcher,!q.regex,q.offset+q.limit+1,deadline);
+        let files:Vec<_>=if let Some(pool)=pool{pool.install(||batch.par_iter().map(read).collect())}
+            else{batch.iter().map(read).collect()};
+        for (path,file) in batch.into_iter().zip(files){
+            scanned+=1;
+            let Some((content,hits))=file else{skipped+=1;continue;};
+            bytes+=content.len();
+            if bytes>64*1024*1024 || Instant::now()>=deadline{exhausted=true;break 'scan;}
+            if hits.is_empty(){continue;}
+            let lines:Vec<_>=content.lines().collect();
+            for i in hits {
+                if Instant::now()>=deadline{exhausted=true;break 'scan;}
+                let line=lines[i];
+                let Some(m)=matcher.find(line)else{continue;};
+                let mut start=m.start().saturating_sub(100);
+                while !line.is_char_boundary(start){start+=1;}
+                let mut end=(start+600).min(line.len());
+                while !line.is_char_boundary(end){end-=1;}
+                let mut hit=json!({"path":path,"line":i+1,"column":line[..m.start()].chars().count()+1,
+                    "preview":&line[start..end],"preview_truncated":start>0||end<line.len()});
+                if q.context>0 {
+                    let first=i.saturating_sub(q.context);
+                    let last=(i+q.context+1).min(lines.len());
+                    hit["context"]=json!((first..last).filter(|n|*n!=i).map(|n|{
+                        let line=lines[n];let mut end=line.len().min(240);
+                        while !line.is_char_boundary(end){end-=1;}
+                        json!({"line":n+1,"text":&line[..end],"truncated":end<line.len()})
+                    }).collect::<Vec<_>>());
+                }
+                if !state.add(hit,q){break 'scan;}
+            }
+        }
+    }
+    let mut result=state.finish(q,scanned,bytes,skipped,exhausted);
+    result["engine"]=json!("fff");
+    result["index_hit"]=json!(cached && warm);
+    result["content_index_ready"]=json!(s.content_index.is_some());
+    result["index_bytes_scanned"]=json!(if warm{0}else{s.content_index.as_ref().map(|i|i.bytes).unwrap_or(0)});
+    result["prefiltered_files"]=json!(filtered);
+    Ok(result)
 }
 struct Page {
     results:Vec<Value>, matched:usize, output_bytes:usize, full:bool,
@@ -318,6 +447,32 @@ pub fn session(root:&Path)->Result<(),String>{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fff_fuzzy_paths_and_content_index_preserve_scope() {
+        let tmp=tempfile::tempdir().unwrap();
+        git2::Repository::init(tmp.path()).unwrap();
+        let root=tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("authentication.rs"),"unique target needle\n").unwrap();
+        std::fs::write(root.join("other.rs"),"unrelated content\n").unwrap();
+        std::fs::write(root.join("unicode.rs"),"\u{212a}elvin needle\n").unwrap();
+        std::fs::write(root.join(".gitignore"),"ignored.rs\n").unwrap();
+        std::fs::write(root.join("ignored.rs"),"unique target needle\n").unwrap();
+        let mut cache=SearchCache::new(&root,true);
+        let path=cache.query(&root,&json!({"mode":"paths","pattern":"authentcation","engine":"fff","limit":1})).unwrap();
+        assert_eq!(path["results"][0]["path"],"authentication.rs");
+        let text=cache.query(&root,&json!({"mode":"text","pattern":"unique target","engine":"fff"})).unwrap();
+        assert_eq!(text["results"][0]["path"],"authentication.rs");
+        assert_eq!(text["results"].as_array().unwrap().len(),1);
+        assert_eq!(text["content_index_ready"],true);
+        let unicode=cache.query(&root,&json!({"mode":"text","pattern":"kelvin","engine":"fff"})).unwrap();
+        assert_eq!(unicode["results"][0]["path"],"unicode.rs");
+        std::fs::write(root.join("other.rs"),"fresh newly matching text\n").unwrap();
+        let fresh=cache.query(&root,&json!({"mode":"text","pattern":"newly matching","engine":"fff","refresh":true})).unwrap();
+        assert_eq!(fresh["results"][0]["path"],"other.rs");
+        let scoped=cache.query(&root,&json!({"mode":"text","pattern":"unique target","engine":"fff","scope":"other.rs"})).unwrap();
+        assert_eq!(scoped["results"],json!([]));
+        assert!(!valid_query(&json!({"mode":"paths","pattern":"x","engine":"shell"})));
+    }
     #[test]
     fn watched_index_refreshes_and_respects_scope() {
         let tmp=tempfile::tempdir().unwrap();

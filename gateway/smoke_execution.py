@@ -248,6 +248,12 @@ def main(agent,gateway,permissions=False):
             fresh=approved("fs_search",query={"mode":"paths","pattern":"brand_new.txt"})
             assert fresh["results"]==[{"path":"brand_new.txt"}],fresh
             assert fresh["index_hit"] is False,fresh
+            fuzzy=approved("fs_search",query={"mode":"paths","engine":"fff","pattern":"lare.txt","limit":1})
+            assert fuzzy["engine"]=="fff" and fuzzy["results"][0]["path"]=="large.txt",fuzzy
+            indexed=approved("fs_search",query={"mode":"text","engine":"fff","pattern":"patched needle"})
+            assert indexed["engine"]=="fff" and indexed["results"][0]["path"]=="large.txt",indexed
+            assert "escape" not in str(indexed["results"])
+            print("PASS: FFF fuzzy paths and indexed text through the existing approval boundary")
             print("PASS: resident search worker, index reuse and invalidation through HTTPS/TLS")
             print("PASS: standalone remote ranged read and targeted patch preview/apply/commit")
             print("PASS: native approved search, ignore rules and junction rejection; real MCP HTTPS/TLS lifecycle, genuine Git result, exact approval, wrong hash, denial, replay, revoke, service restart/recovery, scoped file read and junction escape rejection")
