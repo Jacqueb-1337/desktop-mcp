@@ -89,12 +89,16 @@ fn main() {
             .ok_or("INVALID_WORKER_ARGUMENTS".to_string()).and_then(|(port,nonce)|if raw[0]=="--user-terminal-worker" {user_command::terminal_worker(port,nonce)}else{user_command::worker(port,nonce)});
         std::process::exit(if result.is_ok(){0}else{1});
     }
-    if raw.first().is_some_and(|v|v=="--readonly-status-worker" || v=="--readonly-read-worker" || v=="--readonly-search-worker") {
+    if raw.first().is_some_and(|v|v=="--readonly-status-worker" || v=="--readonly-read-worker" || v=="--readonly-search-worker" || v=="--readonly-range-worker") {
         let read=raw[0]=="--readonly-read-worker";
         let search=raw[0]=="--readonly-search-worker";
-        if raw.len()!=if read || search {4}else{3} || raw[1]!="--workspace" {std::process::exit(2);}
+        let ranged=raw[0]=="--readonly-range-worker";
+        if raw.len()!=if read || search || ranged {4}else{3} || raw[1]!="--workspace" {std::process::exit(2);}
         let result=PathBuf::from(&raw[2]).canonicalize().map_err(|_|"WORKSPACE_UNAVAILABLE".to_string()).and_then(|root| {
-            if search {
+            if ranged {
+                let query:Value=serde_json::from_str(raw[3].to_str().ok_or("INVALID_READ_ARGUMENTS")?).map_err(|_|"INVALID_READ_ARGUMENTS")?;
+                readonly::ranged_read_worker(&root,&query)
+            } else if search {
                 let query: Value=serde_json::from_str(raw[3].to_str().ok_or("INVALID_SEARCH_QUERY")?).map_err(|_|"INVALID_SEARCH_QUERY")?;
                 search::search(&root,&query)
             } else if read {

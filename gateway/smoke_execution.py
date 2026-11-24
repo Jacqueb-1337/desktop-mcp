@@ -3,6 +3,7 @@
 Test automation approves only its disposable repository, never a real workspace.
 """
 import concurrent.futures
+import hashlib
 import http.client
 import json
 import os
@@ -39,7 +40,7 @@ def main(agent,gateway,permissions=False):
             _, _, other_identity = setup_agent(agent, other_root)
             identities.append(other_identity)
         allowed=root/"allowlist.json";allowed.write_text(json.dumps({"version":1,"hosts":[{"host_id":item["host_id"],"public_key":item["public_key"]} for item in identities]}))
-        tools = ["git_status", "fs_read", "fs_search"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
+        tools = ["git_status", "fs_read", "fs_search", "patch_prepare", "patch_review", "patch_apply", "git_commit_patch"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
         policy=root/"policy.json";policy.write_text(json.dumps({"version":1,"hosts":[{"host_id":identity["host_id"],"workspace_id":"default","tools":tools}]}))
         audit=root/"audit";audit.mkdir(mode=0o700)
         token=secrets.token_hex(32);token_path=root/"token";token_path.write_text(token);token_path.chmod(0o600)
@@ -185,6 +186,57 @@ def main(agent,gateway,permissions=False):
             future=pool.submit(call,tool="fs_search",query={"mode":"paths","pattern":"secret"});item=wait_pending(state);approve(state,item)
             result=future.result(20)
             assert not result["isError"] and result["structuredContent"]["outcome"]["data"]["results"]==[],result
+            # Use the production standalone repository mode in an isolated fixture.
+            service.terminate()
+            service.communicate(timeout=5)
+            (state/"selected-repository.txt").write_text(str(repo.resolve()))
+            service=subprocess.Popen([str(agent),"--state-dir",str(state),"--serve-local","--allow-remote-readonly"],
+                stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+            processes.append(service)
+            for _ in range(100):
+                if service.poll() is not None: raise AssertionError(service.stderr.read())
+                try:
+                    local_call(state,"approval_list")
+                    break
+                except (OSError,ValueError):
+                    time.sleep(.05)
+            else: raise AssertionError("Standalone fixture failed to start")
+            def approved(tool,**args):
+                future=pool.submit(call,tool=tool,**args)
+                item=wait_pending(state)
+                assert item["tool"]==tool and not future.done()
+                approve(state,item)
+                result=future.result(20)
+                assert not result["isError"],result
+                return result["structuredContent"]["outcome"]["data"]
+            subprocess.run(["git","-C",str(repo),"config","core.autocrlf","false"],check=True)
+            original=b"padding line\n"*1800+b"unique needle\n"
+            (repo/"large.txt").write_bytes(original)
+            subprocess.run(["git","-C",str(repo),"add","large.txt"],check=True)
+            subprocess.run(["git","-C",str(repo),"commit","-qm","large tracked fixture"],check=True)
+            page=approved("fs_read",path="large.txt",start_line=1801,end_line=1801)
+            assert page["content"]=="unique needle\n",page
+            assert page["sha256"]==hashlib.sha256(original).hexdigest()
+            assert page["bytes"]==len(original)
+            first=approved("fs_read",path="large.txt")
+            assert first["truncated"] and first["next_start_line"]>1
+            second=approved("fs_read",path="large.txt",start_line=first["next_start_line"])
+            assert (first["content"]+second["content"]).encode()==original
+            assert page["sha256"]==second["sha256"]
+            changes=[{"path":"large.txt","operation":"modify","expected_sha256":page["sha256"],
+                "new_content":None,"edits":[{"kind":"exact","old":"unique needle","new":"patched needle"}]}]
+            proposal=approved("patch_prepare",expected_head=page["head"],changes=changes)
+            patch_id=proposal["patch_id"]
+            assert (repo/"large.txt").read_bytes()==original
+            review=approved("patch_review",patch_id=patch_id)
+            assert "+patched needle" in review["diff"],review
+            applied=approved("patch_apply",patch_id=patch_id)
+            assert applied["status"]=="applied"
+            assert (repo/"large.txt").read_bytes()==original.replace(b"unique needle",b"patched needle")
+            committed=approved("git_commit_patch",patch_id=patch_id,message="Targeted edit smoke")
+            assert committed["status"]=="committed"
+            assert (repo/"example.txt").read_text()=="changed\n"
+            print("PASS: standalone remote ranged read and targeted patch preview/apply/commit")
             print("PASS: native approved search, ignore rules and junction rejection; real MCP HTTPS/TLS lifecycle, genuine Git result, exact approval, wrong hash, denial, replay, revoke, service restart/recovery, scoped file read and junction escape rejection")
         finally:
             for process in reversed(processes):

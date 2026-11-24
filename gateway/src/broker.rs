@@ -260,7 +260,11 @@ impl Broker {
         let mut nonce = [0; 32];
         OsRng.fill_bytes(&mut nonce);
         let arguments = match tool {
-            "fs_read" => json!({"path":args["path"]}),
+            "fs_read" => {
+                let mut payload=json!({"path":args["path"]});
+                for key in ["start_line","end_line"] {if let Some(value)=args.get(key){payload[key]=value.clone();}}
+                payload
+            },
             "fs_search" => json!({"query":args["query"]}),
             "use_repository" => json!({"path":args["path"],"initialize":args["initialize"]}),
             "git_snapshot" => json!({"paths":args["paths"],"message":args["message"]}),

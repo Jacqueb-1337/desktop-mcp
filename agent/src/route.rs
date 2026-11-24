@@ -98,7 +98,7 @@ pub fn deny(frame: &Value, own_host_id: &str) -> Result<Value, String> {
                 a.len() == 1 && args["command"].as_str().is_some_and(crate::elevation::valid_command)
             }),
             Some("fs_search") => args.as_object().is_some_and(|a|a.len()==1 && crate::search::valid_query(&args["query"])),
-            Some("fs_read") => args.as_object().is_some_and(|a| a.len() == 1 && args["path"].as_str().is_some_and(crate::readonly::valid_read_path)),
+            Some("fs_read") => crate::readonly::valid_read_args(args),
             Some("use_repository") => args.as_object().is_some_and(|a| a.len() == 2 && args["path"].as_str().is_some_and(valid_repository_path) && args["initialize"].is_boolean()),
             Some("git_snapshot") => valid_snapshot_args(args),
             Some("patch_prepare") => valid_prepare_args(args),

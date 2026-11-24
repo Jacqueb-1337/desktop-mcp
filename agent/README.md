@@ -56,7 +56,9 @@ For a targeted modification, set `new_content` to `null` and provide `edits`, fo
 `[{"kind":"exact","old":"old text","new":"new text"},{"kind":"lines","start":5,"end":6,"new":"replacement\\n"}]`.
 Edits execute sequentially against the evolving in-memory text. Exact text must occur exactly once (including overlapping occurrences); line ranges are 1-based and inclusive. Include any required line terminators. The resulting content goes through the existing hash, Git HEAD, diff preview and apply checks.
 
-`fs_search` takes a `query` object, e.g. `{"mode":"text","pattern":"fn main","regex":false,"limit":100}`. Use `mode:"paths"` for filenames/paths. Search is case-insensitive unless `case_sensitive` is true, respects repository ignore rules, and skips symlinks/reparse points, binary and oversized text files. Results are bounded; inspect `truncated` and `skipped`. Remote search needs its own gateway policy scope and local permission.
+`fs_search` takes a `query` object, e.g. `{"mode":"text","pattern":"fn main","regex":false,"limit":100}`. Use `mode:"paths"` for filenames/paths. Search is case-insensitive unless `case_sensitive` is true, respects repository ignore rules, and skips symlinks/reparse points, binary and oversized text files. Results are bounded; inspect `truncated` and `skipped`. Remote search needs its own gateway policy scope and local permission. Optional scope and exclude entries are repository-relative path prefixes (not globs). Set context to 0?3 neighboring lines, and use next_offset to retrieve the next page with identical query settings; pages assume unchanged files. A scan-budget truncation may require narrowing scope instead.
+
+fs_read supports optional inclusive start_line/end_line and returns full-file SHA-256, Git HEAD (null if unborn), total_lines, and next_start_line. Files up to 8 MiB can be read in pages of at most 16 KiB; an individual line above the page limit is rejected. The separate patch engine still caps editable file size at 256 KiB.
 
 For `create`, set `expected_sha256` to `null`. For `delete`, set `new_content` to `null`.
 

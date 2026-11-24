@@ -91,13 +91,18 @@ fn implemented(name: &str) -> Value {
             schema(json!({}),&[]),true),
         "fs_read" => {
             p["path"]=json!({"type":"string","description":"Relative path within the pinned Git workspace, e.g. src/main.rs"});
-            tool(name,"Implemented: read a UTF-8 file and its SHA-256 precondition. Rejects traversal and symlinks.",
+            p["start_line"]=json!({"type":"integer","minimum":1,"maximum":8388608});
+            p["end_line"]=json!({"type":"integer","minimum":1,"maximum":8388608});
+            tool(name,"Read a bounded UTF-8 line page with full-file SHA-256 and Git HEAD.",
                  schema(p,&["host_id","workspace_id","path"]),true)
         },
         "fs_search" => {
             p["query"]=json!({"type":"object","additionalProperties":false,"properties":{
                 "mode":{"enum":["paths","text"]},"pattern":{"type":"string","minLength":1,"maxLength":512},
-                "regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}},
+                "regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200},
+                "scope":{"type":"string","description":"Repository-relative file or directory"},
+                "exclude":{"type":"array","maxItems":32,"items":{"type":"string"},"description":"Repository-relative path prefixes to exclude"},
+                "context":{"type":"integer","minimum":0,"maximum":3},"offset":{"type":"integer","minimum":0,"maximum":20000}},
                 "required":["mode","pattern"]});
             tool(name,"Search Git-ignore-aware repository paths or UTF-8 text, literal or regex; bounded results.",
                 schema(p,&["host_id","workspace_id","query"]),true)

@@ -369,7 +369,11 @@ impl Agent {
             _ => {
                 self.validate_target(args)?;
                 match name {
-                    "fs_read" => self.fs_read(args),
+                    "fs_read" => {
+                        let mut query=args.clone();
+                        if let Some(o)=query.as_object_mut(){o.remove("host_id");o.remove("workspace_id");}
+                        crate::readonly::ranged_read_worker(&self.workspace,&query)
+                    },
                     "fs_search" => crate::search::search(&self.workspace,&args["query"]),
                     "git_status" => self.git_status(),
                     "git_diff" => self.git_diff(args),
@@ -387,14 +391,6 @@ impl Agent {
                 }
             }
         }
-    }
-
-    fn fs_read(&self, args: &Value) -> ApiResult {
-        let path = required(args, "path")?;
-        let content = self.read_text(path)?
-            .ok_or_else(|| format!("FILE_NOT_FOUND: {path}"))?;
-        Ok(json!({"path":path, "sha256":hash(content.as_bytes()), "bytes":content.len(),
-            "content":content, "head":self.head()?}))
     }
 
     fn git_status(&self) -> ApiResult {

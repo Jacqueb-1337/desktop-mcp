@@ -171,15 +171,73 @@ pub fn read_worker(root: &Path, path: &str) -> Result<Value, String> {
         json!({"path":path,"content":content,"bytes":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes))}),
     )
 }
-pub fn fs_read(root: &Path, args: &Value) -> Result<Value, String> {
-    if args.as_object().is_none_or(|o| o.len() != 1) {
-        return Err("INVALID_READ_ARGUMENTS".into());
+pub fn valid_read_args(args: &Value) -> bool {
+    args.as_object().is_some_and(|o| {
+        o.keys().all(|k| matches!(k.as_str(),"path"|"start_line"|"end_line"))
+        && args["path"].as_str().is_some_and(valid_read_path)
+        && o.get("start_line").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=8_388_608).contains(&n)))
+        && o.get("end_line").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=8_388_608).contains(&n)))
+        && args["end_line"].as_u64().is_none_or(|end| end>=args["start_line"].as_u64().unwrap_or(1))
+    })
+}
+pub fn ranged_read_worker(root:&Path,args:&Value)->Result<Value,String> {
+    use sha2::{Digest,Sha256};
+    validate_root(root)?;
+    if !valid_read_args(args) {return Err("INVALID_READ_ARGUMENTS".into());}
+    let path=args["path"].as_str().unwrap();
+    let mut current=root.to_path_buf();
+    for part in path.split('/') {
+        current.push(part);
+        if reparse(&current)? {return Err("READ_REPARSE_POINT".into());}
     }
-    let path = args["path"]
-        .as_str()
-        .filter(|s| valid_read_path(s))
-        .ok_or("READ_PATH_NOT_PERMITTED")?;
-    run_worker(root, "--readonly-read-worker", Some(path))
+    let dir=cap_std::fs::Dir::open_ambient_dir(root,cap_std::ambient_authority()).map_err(|_|"WORKSPACE_UNAVAILABLE")?;
+    let file=dir.open(path).map_err(|_|"READ_PATH_NOT_PERMITTED_OR_MISSING")?;
+    const MAX_BYTES:usize=8*1024*1024;
+    if !file.metadata().is_ok_and(|m|m.is_file() && m.len()<=MAX_BYTES as u64) {
+        return Err("READ_REQUIRES_REGULAR_FILE_UP_TO_8_MIB".into());
+    }
+    let mut bytes=Vec::new();
+    file.take(MAX_BYTES as u64+1).read_to_end(&mut bytes).map_err(|_|"READ_FAILED")?;
+    if bytes.len()>MAX_BYTES {return Err("READ_LIMIT_8_MIB".into());}
+    let text=std::str::from_utf8(&bytes).map_err(|_|"READ_REQUIRES_UTF8_TEXT")?;
+    if text.contains('\0') {return Err("READ_REQUIRES_UTF8_TEXT".into());}
+    let start=args["start_line"].as_u64().unwrap_or(1) as usize;
+    let end=args["end_line"].as_u64().unwrap_or(u64::MAX).min(8_388_608) as usize;
+    let total=text.split_inclusive('\n').count();
+    if start>total && !(total==0 && start==1) {return Err("READ_LINE_OUT_OF_RANGE".into());}
+    let mut content=String::new();
+    let mut last=start-1;
+    let mut escaped=0usize;
+    for (i,line) in text.split_inclusive('\n').enumerate().skip(start-1).take(end-start+1) {
+        if content.len()+line.len()>16384 {
+            if content.is_empty() {return Err("READ_LINE_EXCEEDS_PAGE_LIMIT".into());}
+            break;
+        }
+        let encoded=serde_json::to_vec(line).map_err(|_|"READ_ENCODING_FAILED")?.len().saturating_sub(2);
+        if escaped+encoded>48000 {
+            if content.is_empty() {return Err("READ_LINE_EXCEEDS_PAGE_LIMIT".into());}
+            break;
+        }
+        content.push_str(line);
+        escaped+=encoded;
+        last=i+1;
+    }
+    let repo=git2::Repository::open_ext(root,git2::RepositoryOpenFlags::NO_SEARCH,std::iter::empty::<&Path>())
+        .map_err(|_|"GIT_REPOSITORY_INVALID")?;
+    if repo.workdir().and_then(|p|p.canonicalize().ok()).as_deref()!=Some(root)
+        || repo.path().canonicalize().ok()!=root.join(".git").canonicalize().ok() {
+        return Err("GIT_WORKSPACE_MISMATCH".into());
+    }
+    let head=repo.head().ok().and_then(|h|h.peel_to_commit().ok()).map(|c|c.id().to_string());
+    Ok(json!({"path":path,"content":content,"bytes":bytes.len(),"page_bytes":content.len(),
+        "sha256":hex::encode(Sha256::digest(&bytes)),"head":head,"start_line":start,"end_line":last,
+        "total_lines":total,"next_start_line":if last<total {Some(last+1)}else{None},
+        "truncated":last<end.min(total)}))
+}
+pub fn fs_read(root: &Path, args: &Value) -> Result<Value, String> {
+    if !valid_read_args(args) {return Err("INVALID_READ_ARGUMENTS".into());}
+    let query=serde_json::to_string(args).map_err(|_|"INVALID_READ_ARGUMENTS")?;
+    run_worker(root,"--readonly-range-worker",Some(&query))
 }
 pub fn git_status(root: &Path, args: &Value) -> Result<Value, String> {
     if args != &json!({}) {
@@ -295,6 +353,34 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
             assert!(read_worker(&root, "escape/secret").is_err());
         }
+    }
+    #[test]
+    fn ranged_read_preserves_full_hash_and_line_terminators() {
+        use sha2::{Digest,Sha256};
+        let tmp=tempfile::tempdir().unwrap();
+        git2::Repository::init(tmp.path()).unwrap();
+        let root=tmp.path().canonicalize().unwrap();
+        let text=format!("{}last", "abcdefghij\r\n".repeat(2000));
+        fs::write(root.join("large.txt"),&text).unwrap();
+        let first=ranged_read_worker(&root,&json!({"path":"large.txt"})).unwrap();
+        assert_eq!(first["bytes"],text.len());
+        assert_eq!(first["sha256"],hex::encode(Sha256::digest(text.as_bytes())));
+        assert_eq!(first["truncated"],true);
+        let next=first["next_start_line"].as_u64().unwrap();
+        let second=ranged_read_worker(&root,&json!({"path":"large.txt","start_line":next})).unwrap();
+        assert_eq!(second["sha256"],first["sha256"]);
+        assert_eq!(second["next_start_line"],Value::Null);
+        assert_eq!(format!("{}{}",first["content"].as_str().unwrap(),second["content"].as_str().unwrap()),text);
+        let last=ranged_read_worker(&root,&json!({"path":"large.txt","start_line":2001,"end_line":2001})).unwrap();
+        assert_eq!(last["content"],"last");
+        assert!(ranged_read_worker(&root,&json!({"path":"large.txt","start_line":2002})).is_err());
+        assert!(!valid_read_args(&json!({"path":"large.txt","start_line":10,"end_line":1})));
+        fs::write(root.join("long.txt"),"x".repeat(20000)).unwrap();
+        assert_eq!(ranged_read_worker(&root,&json!({"path":"long.txt"})).unwrap_err(),"READ_LINE_EXCEEDS_PAGE_LIMIT");
+        fs::write(root.join("empty.txt"),"").unwrap();
+        let empty=ranged_read_worker(&root,&json!({"path":"empty.txt"})).unwrap();
+        assert_eq!(empty["total_lines"],0);
+        assert_eq!(empty["content"],"");
     }
     #[test]
     fn refuses_arguments_and_linked_git_directory() {
