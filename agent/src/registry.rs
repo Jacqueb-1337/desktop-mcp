@@ -102,7 +102,8 @@ fn implemented(name: &str) -> Value {
                 "regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200},
                 "scope":{"type":"string","description":"Repository-relative file or directory"},
                 "exclude":{"type":"array","maxItems":32,"items":{"type":"string"},"description":"Repository-relative path prefixes to exclude"},
-                "context":{"type":"integer","minimum":0,"maximum":3},"offset":{"type":"integer","minimum":0,"maximum":20000}},
+                "context":{"type":"integer","minimum":0,"maximum":3},"offset":{"type":"integer","minimum":0,"maximum":20000},
+                "refresh":{"type":"boolean","description":"Force a fresh filename index"}},
                 "required":["mode","pattern"]});
             tool(name,"Search Git-ignore-aware repository paths or UTF-8 text, literal or regex; bounded results.",
                 schema(p,&["host_id","workspace_id","query"]),true)

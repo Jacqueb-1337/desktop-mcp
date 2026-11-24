@@ -35,6 +35,7 @@ struct Runtime {
 struct Policy {
     mode: String,
     remote_reads_enabled:bool,
+    search_worker:crate::readonly::SearchWorker,
     require_pairing_consent:bool,
     admin_enabled:bool,
     admin_commands_enabled:bool,
@@ -54,6 +55,7 @@ impl Default for Policy {
         Self {
             mode: "ask".into(),
             remote_reads_enabled:false,
+            search_worker:crate::readonly::SearchWorker::default(),
             require_pairing_consent:false,
             admin_enabled:false,
             admin_commands_enabled:false,
@@ -244,6 +246,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 Ok(()) => json!({"enabled":duration.is_some()}),
                 Err(error) => {
                     policy.remote_reads_enabled = false;
+                    policy.search_worker.clear();
                     let _ = persist_remote_gate(dir, false);
                     json!({"error":error})
                 }
@@ -252,7 +255,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
         "set_remote_readonly" => {
             let Some(enabled)=value["enabled"].as_bool() else {return json!({"error":"BOOLEAN_REQUIRED"});};
             if enabled && !remote_capable {return json!({"error":"REMOTE_READONLY_NOT_ENABLED_AT_LAUNCH"});}
-            if !enabled {policy.remote_reads_enabled=false;policy.admin_run=None;policy.terminals.close_all();}
+            if !enabled {policy.remote_reads_enabled=false;policy.search_worker.clear();policy.admin_run=None;policy.terminals.close_all();}
             if let Err(error)=persist_remote_gate(dir,enabled){return json!({"error":error});}
             if !enabled {
                 policy.system_runs.clear();
@@ -271,6 +274,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
         },
         "revoke" => {
             policy.remote_reads_enabled=false;
+            policy.search_worker.clear();
             if let Err(error)=persist_remote_gate(dir,false){return json!({"error":error});}
             if let Err(error)=inbox.clear() { return json!({"error":error}); }
             policy.reset();
@@ -475,16 +479,16 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                         Err(error)=>json!({"pending":false,"executed":true,"error":error}),
                     }
                 },
-                Ok(true) if tool == "use_repository" => match agent.use_repository(
+                Ok(true) if tool == "use_repository" => {policy.search_worker.clear();match agent.use_repository(
                     frame["arguments"]["path"].as_str().unwrap_or(""),
                     frame["arguments"]["initialize"].as_bool().unwrap_or(false),
                 ) {
                     Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
                     Err(error)=>json!({"pending":false,"executed":true,"error":error}),
-                },
+                }},
                 Ok(true)=>match match tool {
                     "git_status"=>crate::readonly::git_status(agent.root(),&frame["arguments"]),
-                    "fs_search"=>crate::readonly::fs_search(agent.root(),&frame["arguments"]),
+                    "fs_search"=>policy.search_worker.query(agent.root(),&frame["arguments"]),
                     "fs_read"=>crate::readonly::fs_read(agent.root(),&frame["arguments"]),
                     _=>Err("UNSUPPORTED_READ_TOOL".into())
                 } {

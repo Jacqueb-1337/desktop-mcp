@@ -92,7 +92,7 @@ pub fn valid_commit_args(args:&Value)->bool {
 }
 pub fn valid_search_query(query:&Value)->bool {
     query.as_object().is_some_and(|o|
-        o.keys().all(|k|matches!(k.as_str(),"mode"|"pattern"|"regex"|"case_sensitive"|"limit"|"scope"|"exclude"|"context"|"offset"))
+        o.keys().all(|k|matches!(k.as_str(),"mode"|"pattern"|"regex"|"case_sensitive"|"limit"|"scope"|"exclude"|"context"|"offset"|"refresh"))
         && matches!(query["mode"].as_str(),Some("paths"|"text"))
         && query["pattern"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=512 && !s.contains('\0'))
         && o.get("regex").is_none_or(Value::is_boolean)
@@ -101,7 +101,8 @@ pub fn valid_search_query(query:&Value)->bool {
         && o.get("scope").is_none_or(|v|v.as_str().is_some_and(valid_rel_patch_path))
         && o.get("exclude").is_none_or(|v|v.as_array().is_some_and(|a|a.len()<=32 && a.iter().all(|p|p.as_str().is_some_and(valid_rel_patch_path))))
         && o.get("context").is_none_or(|v|v.as_u64().is_some_and(|n|n<=3))
-        && o.get("offset").is_none_or(|v|v.as_u64().is_some_and(|n|n<=20000)))
+        && o.get("offset").is_none_or(|v|v.as_u64().is_some_and(|n|n<=20000))
+        && o.get("refresh").is_none_or(Value::is_boolean))
 }
 pub fn valid_duration(duration: &str) -> bool {
     matches!(duration, "permanent" | "1h" | "4h") || duration.strip_suffix('m').is_some_and(|minutes| {

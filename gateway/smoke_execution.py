@@ -236,6 +236,19 @@ def main(agent,gateway,permissions=False):
             committed=approved("git_commit_patch",patch_id=patch_id,message="Targeted edit smoke")
             assert committed["status"]=="committed"
             assert (repo/"example.txt").read_text()=="changed\n"
+            paths={"mode":"paths","pattern":"large.txt"}
+            cold=approved("fs_search",query={**paths,"refresh":True})
+            assert cold["results"]==[{"path":"large.txt"}] and cold["index_hit"] is False,cold
+            warm=approved("fs_search",query=paths)
+            assert warm["results"]==cold["results"],warm
+            if cold.get("index_watch_active"):
+                assert warm["index_hit"],warm
+            (repo/"brand_new.txt").write_text("needle")
+            time.sleep(.3)
+            fresh=approved("fs_search",query={"mode":"paths","pattern":"brand_new.txt"})
+            assert fresh["results"]==[{"path":"brand_new.txt"}],fresh
+            assert fresh["index_hit"] is False,fresh
+            print("PASS: resident search worker, index reuse and invalidation through HTTPS/TLS")
             print("PASS: standalone remote ranged read and targeted patch preview/apply/commit")
             print("PASS: native approved search, ignore rules and junction rejection; real MCP HTTPS/TLS lifecycle, genuine Git result, exact approval, wrong hash, denial, replay, revoke, service restart/recovery, scoped file read and junction escape rejection")
         finally:

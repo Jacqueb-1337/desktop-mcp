@@ -245,12 +245,84 @@ pub fn git_status(root: &Path, args: &Value) -> Result<Value, String> {
     }
     run_worker(root, "--readonly-status-worker", None)
 }
-pub fn fs_search(root: &Path, args: &Value) -> Result<Value, String> {
-    if args.as_object().is_none_or(|o|o.len()!=1) || !crate::search::valid_query(&args["query"]) {
-        return Err("INVALID_SEARCH_QUERY".into());
+
+/// A single workspace-pinned child. I/O is isolated from the service thread and
+/// has the same hard deadline and bounded JSON response as one-shot workers.
+#[derive(Debug,Default)]
+pub struct SearchWorker {
+    session:Option<SearchSession>,
+}
+#[derive(Debug)]
+struct SearchSession {
+    root:std::path::PathBuf,
+    child:std::process::Child,
+    requests:std::sync::mpsc::SyncSender<Vec<u8>>,
+    responses:std::sync::mpsc::Receiver<Result<Value,String>>,
+}
+impl Drop for SearchSession {
+    fn drop(&mut self) {
+        let _=self.child.kill();
+        let _=self.child.wait();
     }
-    let query = serde_json::to_string(&args["query"]).map_err(|_|"INVALID_SEARCH_QUERY")?;
-    run_worker(root, "--readonly-search-worker", Some(&query))
+}
+impl SearchWorker {
+    pub fn clear(&mut self){self.session=None;}
+    pub fn query(&mut self,root:&Path,args:&Value)->Result<Value,String> {
+        validate_root(root)?;
+        if args.as_object().is_none_or(|o|o.len()!=1)||!crate::search::valid_query(&args["query"]) {
+            return Err("INVALID_SEARCH_QUERY".into());
+        }
+        if self.session.as_ref().is_some_and(|s|s.root!=root){self.clear();}
+        if self.session.is_none(){self.session=Some(SearchSession::start(root)?);}
+        let mut request=serde_json::to_vec(&args["query"]).map_err(|_|"INVALID_SEARCH_QUERY")?;
+        request.push(b'\n');
+        if request.len()>32768{return Err("SEARCH_INPUT_LIMIT".into());}
+        let session=self.session.as_ref().unwrap();
+        if session.requests.try_send(request).is_err(){self.clear();return Err("SEARCH_WORKER_UNAVAILABLE".into());}
+        let response=session.responses.recv_timeout(Duration::from_secs(6));
+        match response {
+            Ok(Ok(v))=> {
+                if let Some(error)=v["error"].as_str(){return Err(error.into());}
+                v.get("data").cloned().ok_or("SEARCH_OUTPUT_INVALID".into())
+            }
+            Ok(Err(error))=>{self.clear();Err(error)}
+            Err(_)=>{self.clear();Err("SEARCH_WORKER_TIMEOUT".into())}
+        }
+    }
+}
+impl SearchSession {
+    fn start(root:&Path)->Result<Self,String> {
+        use std::io::{BufRead,BufReader,Write};
+        let executable=std::env::current_exe().map_err(|_|"SEARCH_WORKER_UNAVAILABLE")?;
+        let mut command=Command::new(executable);
+        command.env_clear().args(["--readonly-search-session","--workspace"]).arg(root)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(windows)] {
+            use std::os::windows::process::CommandExt;
+            command.env("SystemRoot",std::env::var_os("SystemRoot").ok_or("SYSTEM_ROOT_UNAVAILABLE")?);
+            command.creation_flags(0x08000000);
+        }
+        let mut child=command.spawn().map_err(|_|"SEARCH_WORKER_UNAVAILABLE")?;
+        let Some(mut input)=child.stdin.take()else{let _=child.kill();let _=child.wait();return Err("SEARCH_WORKER_PIPE".into());};
+        let Some(output)=child.stdout.take()else{let _=child.kill();let _=child.wait();return Err("SEARCH_WORKER_PIPE".into());};
+        let (requests,rx)=std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx,responses)=std::sync::mpsc::sync_channel(1);
+        thread::spawn(move||{
+            let mut reader=BufReader::new(output);
+            while let Ok(request)=rx.recv(){
+                let result=(|| {
+                    input.write_all(&request).and_then(|_|input.flush()).map_err(|_|"SEARCH_WORKER_WRITE_FAILED".to_string())?;
+                    let mut bytes=Vec::new();
+                    let n=reader.by_ref().take(65537).read_until(b'\n',&mut bytes).map_err(|_|"SEARCH_WORKER_READ_FAILED".to_string())?;
+                    if n==0||n>65536||!bytes.ends_with(b"\n"){return Err("SEARCH_OUTPUT_LIMIT_OR_EOF".into());}
+                    serde_json::from_slice::<Value>(&bytes).map_err(|_|"SEARCH_OUTPUT_INVALID".into())
+                })();
+                let failed=result.is_err();
+                if tx.send(result).is_err()||failed{break;}
+            }
+        });
+        Ok(Self{root:root.to_path_buf(),child,requests,responses})
+    }
 }
 fn run_worker(root: &Path, mode: &str, path: Option<&str>) -> Result<Value, String> {
     validate_root(root)?;
