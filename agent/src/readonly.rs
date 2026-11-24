@@ -9,7 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-fn reparse(path: &Path) -> Result<bool, String> {
+pub(crate) fn reparse(path: &Path) -> Result<bool, String> {
     let m = fs::symlink_metadata(path).map_err(|_| "WORKSPACE_UNAVAILABLE")?;
     #[cfg(windows)]
     {
@@ -21,7 +21,7 @@ fn reparse(path: &Path) -> Result<bool, String> {
         Ok(m.file_type().is_symlink())
     }
 }
-fn validate_root(root: &Path) -> Result<(), String> {
+pub(crate) fn validate_root(root: &Path) -> Result<(), String> {
     // Refuse linked worktrees and submodules whose Git directory lives elsewhere.
     if !root.is_absolute()
         || reparse(root)?
@@ -179,26 +179,29 @@ pub fn fs_read(root: &Path, args: &Value) -> Result<Value, String> {
         .as_str()
         .filter(|s| valid_read_path(s))
         .ok_or("READ_PATH_NOT_PERMITTED")?;
-    run_worker(root, Some(path))
+    run_worker(root, "--readonly-read-worker", Some(path))
 }
 pub fn git_status(root: &Path, args: &Value) -> Result<Value, String> {
     if args != &json!({}) {
         return Err("INVALID_GIT_STATUS_ARGUMENTS".into());
     }
-    run_worker(root, None)
+    run_worker(root, "--readonly-status-worker", None)
 }
-fn run_worker(root: &Path, path: Option<&str>) -> Result<Value, String> {
+pub fn fs_search(root: &Path, args: &Value) -> Result<Value, String> {
+    if args.as_object().is_none_or(|o|o.len()!=1) || !crate::search::valid_query(&args["query"]) {
+        return Err("INVALID_SEARCH_QUERY".into());
+    }
+    let query = serde_json::to_string(&args["query"]).map_err(|_|"INVALID_SEARCH_QUERY")?;
+    run_worker(root, "--readonly-search-worker", Some(&query))
+}
+fn run_worker(root: &Path, mode: &str, path: Option<&str>) -> Result<Value, String> {
     validate_root(root)?;
     let executable = std::env::current_exe().map_err(|_| "STATUS_WORKER_UNAVAILABLE")?;
     let mut command = Command::new(executable);
     command
         .env_clear()
         .args([
-            if path.is_some() {
-                "--readonly-read-worker"
-            } else {
-                "--readonly-status-worker"
-            },
+            mode,
             "--workspace",
         ])
         .arg(root);

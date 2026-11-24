@@ -54,12 +54,26 @@ pub fn valid_snapshot_args(args:&Value)->bool {
     && args["message"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=200
         && !s.chars().any(char::is_control))
 }
+fn valid_text_edits(value:&Value)->bool {
+    let text=|v:&Value| v.as_str().is_some_and(|s|s.len()<=48000 && !s.contains('\0'));
+    value.as_array().is_some_and(|items|!items.is_empty() && items.len()<=32 &&
+        items.iter().all(|e| e.as_object().is_some_and(|o| match e["kind"].as_str() {
+            Some("exact") => o.len()==3 && text(&e["old"]) && e["old"].as_str().is_some_and(|s|!s.is_empty()) && text(&e["new"]),
+            Some("lines") => o.len()==4 && e["start"].as_u64().zip(e["end"].as_u64()).is_some_and(|(s,n)|s>0 && s<=n) && text(&e["new"]),
+            _=>false,
+        })))
+}
 pub fn valid_prepare_args(args:&Value)->bool {
     args.as_object().is_some_and(|o|o.len()==2)
     && args["expected_head"].as_str().is_some_and(|s|s.len()==40 && s.bytes().all(|b|b.is_ascii_hexdigit()))
     && args["changes"].as_array().is_some_and(|items|!items.is_empty() && items.len()<=16
         && items.iter().all(|item|{
-            item.as_object().is_some_and(|o|o.len()==4)
+            item.as_object().is_some_and(|o| {
+                ["path","operation","expected_sha256","new_content"].iter().all(|k|o.contains_key(*k))
+                && (o.len()==4 || (o.len()==5 && o.contains_key("edits")
+                    && item["operation"]=="modify" && item["new_content"].is_null()
+                    && valid_text_edits(&item["edits"])))
+            })
             && item["path"].as_str().is_some_and(valid_rel_patch_path)
             && matches!(item["operation"].as_str(),Some("create"|"modify"|"delete"))
             && (item["expected_sha256"].is_null()||item["expected_sha256"].as_str()
@@ -75,6 +89,15 @@ pub fn valid_commit_args(args:&Value)->bool {
         Ok(v) if v.get_version()==Some(uuid::Version::Random) && v.to_string()==s))
     && args["message"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=200
         && !s.chars().any(char::is_control))
+}
+pub fn valid_search_query(query:&Value)->bool {
+    query.as_object().is_some_and(|o|
+        o.keys().all(|k|matches!(k.as_str(),"mode"|"pattern"|"regex"|"case_sensitive"|"limit"))
+        && matches!(query["mode"].as_str(),Some("paths"|"text"))
+        && query["pattern"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=512 && !s.contains('\0'))
+        && o.get("regex").is_none_or(Value::is_boolean)
+        && o.get("case_sensitive").is_none_or(Value::is_boolean)
+        && o.get("limit").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=200).contains(&n))))
 }
 pub fn valid_duration(duration: &str) -> bool {
     matches!(duration, "permanent" | "1h" | "4h") || duration.strip_suffix('m').is_some_and(|minutes| {
@@ -97,13 +120,13 @@ impl PolicyFile {
             if host.host_id.len()!=32||!host.host_id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err("INVALID_POLICY_HOST_ID".into())
             }
-            if host.workspace_id!="default"||host.tools.len()>14 {
+            if host.workspace_id!="default"||host.tools.len()>15 {
                 return Err("INVALID_POLICY_WORKSPACE_OR_TOOLS".into())
             }
             if !unique.insert((host.host_id.as_str(),host.workspace_id.as_str())) {
                 return Err("DUPLICATE_POLICY_SCOPE".into())
             }
-            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command")) {
+            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"fs_search"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command")) {
                 return Err("UNSAFE_POLICY_TOOL".into())
             }
             if host.tools.iter().collect::<HashSet<_>>().len()!=host.tools.len() {

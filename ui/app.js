@@ -55,13 +55,13 @@ async function refreshApprovals() {
       const title = document.createElement("strong");
       const permission = item.tool === "request_permission";
       if (permission) {
-        const labels = { pairing: "Pair this PC", git_status: "Allow Git status", fs_read: "Allow project file reads", system_volume_status: "Allow Windows system volume checks", admin_command: "Allow requests for elevated PowerShell commands" };
+        const labels = { pairing: "Pair this PC", git_status: "Allow Git status", fs_read: "Allow project file reads", fs_search: "Allow project file search", system_volume_status: "Allow Windows system volume checks", admin_command: "Allow requests for elevated PowerShell commands" };
         const durations = { "30m": "30 minutes", "1h": "1 hour", "4h": "4 hours", permanent: "until revoked" };
         const requested = item.arguments.duration;
         const duration = durations[requested] || (requested.endsWith("m") ? requested.slice(0, -1) + " minutes" : requested);
         title.textContent = labels[item.arguments.capability] + " · " + duration;
       } else {
-        const labels = { fs_read: "File read request", git_status: "Git status request",
+        const labels = { fs_read: "File read request", fs_search: "Project search request", git_status: "Git status request",
           system_volume_status: "Windows system volume check (requires UAC)", admin_command: "Elevated PowerShell command" };
         title.textContent = labels[item.tool] || "Tool request";
       }

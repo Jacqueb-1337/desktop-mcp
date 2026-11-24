@@ -21,7 +21,7 @@ By default the server is read-only. To explicitly enable file changes for a trus
 ## Working tools
 
 - `gateway_info`, `list_hosts`, `get_capabilities`
-- `fs_read`, `git_status`, `git_diff`
+- `fs_read`, `fs_search`, `git_status`, `git_diff`
 - `patch_prepare`, `patch_review`, `patch_status`, `patch_apply`, `git_commit_patch`
 
 Other advertised tools are deliberately marked as **NOT_IMPLEMENTED** and return errors without side effects. Their generic argument wrapper allows implementing new functionality without changing tool names/schemas.
@@ -51,6 +51,12 @@ Other advertised tools are deliberately marked as **NOT_IMPLEMENTED** and return
   ]
 }
 ```
+
+For a targeted modification, set `new_content` to `null` and provide `edits`, for example:
+`[{"kind":"exact","old":"old text","new":"new text"},{"kind":"lines","start":5,"end":6,"new":"replacement\\n"}]`.
+Edits execute sequentially against the evolving in-memory text. Exact text must occur exactly once (including overlapping occurrences); line ranges are 1-based and inclusive. Include any required line terminators. The resulting content goes through the existing hash, Git HEAD, diff preview and apply checks.
+
+`fs_search` takes a `query` object, e.g. `{"mode":"text","pattern":"fn main","regex":false,"limit":100}`. Use `mode:"paths"` for filenames/paths. Search is case-insensitive unless `case_sensitive` is true, respects repository ignore rules, and skips symlinks/reparse points, binary and oversized text files. Results are bounded; inspect `truncated` and `skipped`. Remote search needs its own gateway policy scope and local permission.
 
 For `create`, set `expected_sha256` to `null`. For `delete`, set `new_content` to `null`.
 

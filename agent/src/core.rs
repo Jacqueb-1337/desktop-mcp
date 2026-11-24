@@ -24,6 +24,63 @@ struct PatchChange {
     operation: String,
     expected_sha256: Option<String>,
     new_content: Option<String>,
+    #[serde(default)]
+    edits: Option<Vec<TextEdit>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TextEdit {
+    Exact { old: String, new: String },
+    Lines { start: usize, end: usize, new: String },
+}
+
+pub(crate) fn valid_text_edits(edits: &Value) -> bool {
+    serde_json::from_value::<Vec<TextEdit>>(edits.clone()).is_ok_and(|edits| {
+        !edits.is_empty() && edits.len() <= 32 && edits.iter().all(|edit| match edit {
+            TextEdit::Exact { old, new } => !old.is_empty() && old.len() <= 48000 &&
+                new.len() <= 48000 && !old.contains('\0') && !new.contains('\0'),
+            TextEdit::Lines { start, end, new } => *start > 0 && start <= end &&
+                new.len() <= 48000 && !new.contains('\0'),
+        })
+    })
+}
+
+fn apply_text_edits(original: &str, edits: &[TextEdit]) -> Result<String, String> {
+    if edits.is_empty() || edits.len() > 32 { return Err("INVALID_TEXT_EDITS".into()); }
+    let mut text = original.to_owned();
+    for edit in edits {
+        match edit {
+            TextEdit::Exact { old, new } => {
+                if old.is_empty() || old.contains('\0') || new.contains('\0') {
+                    return Err("INVALID_EXACT_EDIT".into());
+                }
+                let start = text.find(old).ok_or("EDIT_TEXT_NOT_FOUND")?;
+                // Search one character after the first start, so overlapping matches
+                // are also ambiguous.
+                let next = start + text[start..].chars().next().unwrap().len_utf8();
+                if text[next..].contains(old) { return Err("EDIT_TEXT_AMBIGUOUS".into()); }
+                text.replace_range(start..start + old.len(), new);
+            }
+            TextEdit::Lines { start, end, new } => {
+                if *start == 0 || start > end || new.contains('\0') {
+                    return Err("INVALID_LINE_RANGE".into());
+                }
+                let mut offset = 0;
+                let mut from = None;
+                let mut to = None;
+                for (index, line) in text.split_inclusive('\n').enumerate() {
+                    if index + 1 == *start { from = Some(offset); }
+                    offset += line.len();
+                    if index + 1 == *end { to = Some(offset); break; }
+                }
+                text.replace_range(from.ok_or("EDIT_LINE_OUT_OF_RANGE")?..
+                    to.ok_or("EDIT_LINE_OUT_OF_RANGE")?, new);
+            }
+        }
+        if text.len() as u64 > MAX_FILE_BYTES { return Err("FILE_TOO_LARGE".into()); }
+    }
+    Ok(text)
 }
 
 #[derive(Debug, Clone)]
@@ -304,7 +361,7 @@ impl Agent {
             "list_hosts" => Ok(json!({"hosts":[{"host_id":"local","name":"Local computer","connected":true,"workspace_ids":["default"]}]})),
             "get_capabilities" => Ok(json!({
                 "host_id":"local", "workspace_id":"default",
-                "implemented":["gateway_info","list_hosts","get_capabilities","fs_read","git_status","git_diff",
+                "implemented":["gateway_info","list_hosts","get_capabilities","fs_read","fs_search","git_status","git_diff",
                     "patch_prepare","patch_review","patch_apply","patch_status","git_commit_patch"],
                 "writes_enabled":self.allow_writes,
                 "remote_pairing":false,"admin":false,"shell":false
@@ -313,6 +370,7 @@ impl Agent {
                 self.validate_target(args)?;
                 match name {
                     "fs_read" => self.fs_read(args),
+                    "fs_search" => crate::search::search(&self.workspace,&args["query"]),
                     "git_status" => self.git_status(),
                     "git_diff" => self.git_diff(args),
                     "git_snapshot" => self.git_snapshot(args),
@@ -430,7 +488,7 @@ impl Agent {
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
         let mut diff = String::new();
-        for requested in changes {
+        for mut requested in changes {
             if !seen.insert(requested.path.clone()) {
                 return Err(format!("DUPLICATE_PATH: {}",requested.path));
             }
@@ -442,6 +500,13 @@ impl Agent {
                     requested.path,requested.expected_sha256,current_sha));
             }
             self.target_clean(&requested.path)?;
+            if let Some(edits) = requested.edits.take() {
+                if requested.operation != "modify" || requested.new_content.is_some() {
+                    return Err("EDITS_REQUIRE_MODIFY_WITH_NULL_NEW_CONTENT".into());
+                }
+                let original = current.as_deref().ok_or("EDIT_REQUIRES_EXISTING_FILE")?;
+                requested.new_content = Some(apply_text_edits(original, &edits)?);
+            }
             match requested.operation.as_str() {
                 "modify" if current.is_some() && requested.new_content.is_some() => {},
                 "create" if current.is_none() && requested.new_content.is_some() => {},
@@ -868,6 +933,34 @@ mod tests {
         assert_eq!(names.trim(),"file.txt");
         assert_eq!(fs::read_to_string(tmp.path().join("unrelated.txt")).unwrap(),"user work\n");
         assert!(git(tmp.path(),&["status","--porcelain"],None).unwrap().contains("unrelated.txt"));
+    }
+    #[test]
+    fn targeted_edits_are_previewed_and_applied_without_full_file_payload() {
+        let (tmp,mut agent,head)=fixture();
+        let req=json!({"host_id":"local","workspace_id":"default","expected_head":head,
+            "changes":[{"path":"file.txt","operation":"modify","expected_sha256":hash(b"before\n"),
+            "new_content":null,"edits":[{"kind":"exact","old":"before","new":"intermediate"},
+            {"kind":"lines","start":1,"end":1,"new":"after\r\n"}]}]});
+        let out=agent.dispatch("patch_prepare",&req).unwrap();
+        assert!(out["diff"].as_str().unwrap().contains("+after"));
+        assert_eq!(fs::read_to_string(tmp.path().join("file.txt")).unwrap(),"before\n");
+        agent.dispatch("patch_apply",&json!({"host_id":"local","workspace_id":"default",
+            "patch_id":out["patch_id"]})).unwrap();
+        assert_eq!(fs::read_to_string(tmp.path().join("file.txt")).unwrap(),"after\r\n");
+    }
+    #[test]
+    fn targeted_edits_reject_ambiguity_missing_text_and_out_of_bounds_lines() {
+        for (original,edit) in [
+            ("aaa",json!({"kind":"exact","old":"aa","new":"x"})),
+            ("abc",json!({"kind":"exact","old":"z","new":"x"})),
+            ("abc",json!({"kind":"lines","start":1,"end":2,"new":"x"})),
+            ("abc",json!({"kind":"lines","start":0,"end":1,"new":"x"})),
+        ] {
+            let edits=serde_json::from_value::<Vec<TextEdit>>(json!([edit])).unwrap();
+            assert!(apply_text_edits(original,&edits).is_err());
+        }
+        let edits=serde_json::from_value::<Vec<TextEdit>>(json!([{"kind":"lines","start":2,"end":2,"new":"x\r\n"}])).unwrap();
+        assert_eq!(apply_text_edits("a\r\nb\r\nc",&edits).unwrap(),"a\r\nx\r\nc");
     }
     #[test]
     fn stale_file_refuses_prepare() {

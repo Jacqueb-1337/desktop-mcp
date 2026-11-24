@@ -55,7 +55,7 @@ const RESERVED: &[&str] = &[
 ];
 
 const IMPLEMENTED: &[&str] = &[
-    "gateway_info", "list_hosts", "get_capabilities", "fs_read",
+    "gateway_info", "list_hosts", "get_capabilities", "fs_read", "fs_search",
     "git_status", "git_diff", "patch_prepare", "patch_review",
     "patch_apply", "patch_status", "git_commit_patch"
 ];
@@ -94,6 +94,14 @@ fn implemented(name: &str) -> Value {
             tool(name,"Implemented: read a UTF-8 file and its SHA-256 precondition. Rejects traversal and symlinks.",
                  schema(p,&["host_id","workspace_id","path"]),true)
         },
+        "fs_search" => {
+            p["query"]=json!({"type":"object","additionalProperties":false,"properties":{
+                "mode":{"enum":["paths","text"]},"pattern":{"type":"string","minLength":1,"maxLength":512},
+                "regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}},
+                "required":["mode","pattern"]});
+            tool(name,"Search Git-ignore-aware repository paths or UTF-8 text, literal or regex; bounded results.",
+                schema(p,&["host_id","workspace_id","query"]),true)
+        },
         "git_status" => tool(name,"Implemented: show Git HEAD and porcelain worktree status.",
                  schema(p,&["host_id","workspace_id"]),true),
         "git_diff" => {
@@ -110,7 +118,13 @@ fn implemented(name: &str) -> Value {
                         "path":{"type":"string"},
                         "operation":{"type":"string","enum":["create","modify","delete"]},
                         "expected_sha256":{"type":["string","null"]},
-                        "new_content":{"type":["string","null"]}
+                        "new_content":{"type":["string","null"]},
+        "edits":{"type":"array","minItems":1,"maxItems":32,
+          "description":"Optional sequential targeted edits for modify; set new_content to null. Exact text must occur once. Lines are 1-based inclusive; replacement includes any desired line terminator.",
+          "items":{"oneOf":[
+            {"type":"object","additionalProperties":false,"properties":{"kind":{"const":"exact"},"old":{"type":"string","minLength":1},"new":{"type":"string"}},"required":["kind","old","new"]},
+            {"type":"object","additionalProperties":false,"properties":{"kind":{"const":"lines"},"start":{"type":"integer","minimum":1},"end":{"type":"integer","minimum":1},"new":{"type":"string"}},"required":["kind","start","end","new"]}
+          ]}}
                     },"required":["path","operation","expected_sha256","new_content"]}});
             tool(name,"Implemented, read-only: verify Git HEAD, file hashes and clean targets; produce unified diff proposal without writing.",
                  schema(p,&["host_id","workspace_id","expected_head","changes"]),true)

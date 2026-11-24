@@ -482,7 +482,12 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
                     Err(error)=>json!({"pending":false,"executed":true,"error":error}),
                 },
-                Ok(true)=>match if frame["tool"]=="git_status" {crate::readonly::git_status(agent.root(),&frame["arguments"])}else{crate::readonly::fs_read(agent.root(),&frame["arguments"])} {
+                Ok(true)=>match match tool {
+                    "git_status"=>crate::readonly::git_status(agent.root(),&frame["arguments"]),
+                    "fs_search"=>crate::readonly::fs_search(agent.root(),&frame["arguments"]),
+                    "fs_read"=>crate::readonly::fs_read(agent.root(),&frame["arguments"]),
+                    _=>Err("UNSUPPORTED_READ_TOOL".into())
+                } {
                     Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
                     Err(error)=>json!({"pending":false,"executed":true,"error":error}),
                 },

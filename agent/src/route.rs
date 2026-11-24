@@ -28,7 +28,12 @@ pub fn valid_prepare_args(args:&Value) -> bool {
     && args["expected_head"].as_str().is_some_and(|s|s.len()==40 && s.bytes().all(|b|b.is_ascii_hexdigit()))
     && args["changes"].as_array().is_some_and(|items|!items.is_empty() && items.len()<=16
         && items.iter().all(|item|{
-            item.as_object().is_some_and(|o|o.len()==4)
+            item.as_object().is_some_and(|o| {
+                ["path","operation","expected_sha256","new_content"].iter().all(|k|o.contains_key(*k))
+                && (o.len()==4 || (o.len()==5 && o.contains_key("edits")
+                    && item["operation"]=="modify" && item["new_content"].is_null()
+                    && crate::core::valid_text_edits(&item["edits"])))
+            })
             && item["path"].as_str().is_some_and(crate::readonly::valid_read_path)
             && matches!(item["operation"].as_str(),Some("create"|"modify"|"delete"))
             && (item["expected_sha256"].is_null()||item["expected_sha256"].as_str()
@@ -77,7 +82,7 @@ pub fn deny(frame: &Value, own_host_id: &str) -> Result<Value, String> {
         || (!executable && frame.get("version")!=Some(&json!(1)))
         || frame.get("target_host_id")!=Some(&json!(own_host_id))
         || frame.get("workspace_id")!=Some(&json!("default"))
-        || !(matches!(frame["tool"].as_str(),Some("fs_read"|"git_status"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"))
+        || !(matches!(frame["tool"].as_str(),Some("fs_read"|"fs_search"|"git_status"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"))
             || (executable && matches!(frame["tool"].as_str(), Some("request_permission" | "admin_command_result" | crate::elevation::TOOL | crate::elevation::COMMAND | crate::user_command::TOOL | crate::user_command::RESULT | crate::user_command::ELEVATED | crate::user_command::ELEVATED_RESULT))) || (executable && frame["tool"].as_str().is_some_and(crate::terminal::is_tool))) {
         return Err("ROUTE_NOT_PERMITTED".into());
     }
@@ -92,6 +97,7 @@ pub fn deny(frame: &Value, own_host_id: &str) -> Result<Value, String> {
             Some(crate::elevation::COMMAND | crate::user_command::TOOL | crate::user_command::ELEVATED) => args.as_object().is_some_and(|a| {
                 a.len() == 1 && args["command"].as_str().is_some_and(crate::elevation::valid_command)
             }),
+            Some("fs_search") => args.as_object().is_some_and(|a|a.len()==1 && crate::search::valid_query(&args["query"])),
             Some("fs_read") => args.as_object().is_some_and(|a| a.len() == 1 && args["path"].as_str().is_some_and(crate::readonly::valid_read_path)),
             Some("use_repository") => args.as_object().is_some_and(|a| a.len() == 2 && args["path"].as_str().is_some_and(valid_repository_path) && args["initialize"].is_boolean()),
             Some("git_snapshot") => valid_snapshot_args(args),
@@ -100,7 +106,7 @@ pub fn deny(frame: &Value, own_host_id: &str) -> Result<Value, String> {
             Some("git_commit_patch") => valid_commit_args(args),
             Some("request_permission") => args.as_object().is_some_and(|a| {
                 a.len() == 2
-                    && matches!(args["capability"].as_str(), Some("pairing" | "git_status" | "fs_read" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | crate::elevation::TOOL | crate::elevation::COMMAND | crate::user_command::TOOL | crate::user_command::ELEVATED))
+                    && matches!(args["capability"].as_str(), Some("pairing" | "git_status" | "fs_read" | "fs_search" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | crate::elevation::TOOL | crate::elevation::COMMAND | crate::user_command::TOOL | crate::user_command::ELEVATED))
                     && args["duration"].as_str().and_then(permission_duration).is_some()
             }),
             Some(tool) if crate::terminal::is_tool(tool) => crate::terminal::valid_args(tool,args),

@@ -7,6 +7,7 @@ mod gateway_client;
 mod control;
 mod route;
 mod readonly;
+mod search;
 mod windows_acl;
 mod unattended;
 mod user_command;
@@ -88,10 +89,18 @@ fn main() {
             .ok_or("INVALID_WORKER_ARGUMENTS".to_string()).and_then(|(port,nonce)|if raw[0]=="--user-terminal-worker" {user_command::terminal_worker(port,nonce)}else{user_command::worker(port,nonce)});
         std::process::exit(if result.is_ok(){0}else{1});
     }
-    if raw.first().is_some_and(|v|v=="--readonly-status-worker" || v=="--readonly-read-worker") {
+    if raw.first().is_some_and(|v|v=="--readonly-status-worker" || v=="--readonly-read-worker" || v=="--readonly-search-worker") {
         let read=raw[0]=="--readonly-read-worker";
-        if raw.len()!=if read {4}else{3} || raw[1]!="--workspace" {std::process::exit(2);}
-        let result=PathBuf::from(&raw[2]).canonicalize().map_err(|_|"WORKSPACE_UNAVAILABLE".to_string()).and_then(|root|if read {raw[3].to_str().ok_or("READ_PATH_ENCODING".to_string()).and_then(|path|readonly::read_worker(&root,path))}else{readonly::status_worker(&root)});
+        let search=raw[0]=="--readonly-search-worker";
+        if raw.len()!=if read || search {4}else{3} || raw[1]!="--workspace" {std::process::exit(2);}
+        let result=PathBuf::from(&raw[2]).canonicalize().map_err(|_|"WORKSPACE_UNAVAILABLE".to_string()).and_then(|root| {
+            if search {
+                let query: Value=serde_json::from_str(raw[3].to_str().ok_or("INVALID_SEARCH_QUERY")?).map_err(|_|"INVALID_SEARCH_QUERY")?;
+                search::search(&root,&query)
+            } else if read {
+                raw[3].to_str().ok_or("READ_PATH_ENCODING".to_string()).and_then(|path|readonly::read_worker(&root,path))
+            } else {readonly::status_worker(&root)}
+        });
         println!("{}",match result {Ok(data)=>json!({"data":data}),Err(error)=>json!({"error":error})});return;
     }
 

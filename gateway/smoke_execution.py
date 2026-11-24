@@ -39,7 +39,7 @@ def main(agent,gateway,permissions=False):
             _, _, other_identity = setup_agent(agent, other_root)
             identities.append(other_identity)
         allowed=root/"allowlist.json";allowed.write_text(json.dumps({"version":1,"hosts":[{"host_id":item["host_id"],"public_key":item["public_key"]} for item in identities]}))
-        tools = ["git_status", "fs_read"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
+        tools = ["git_status", "fs_read", "fs_search"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
         policy=root/"policy.json";policy.write_text(json.dumps({"version":1,"hosts":[{"host_id":identity["host_id"],"workspace_id":"default","tools":tools}]}))
         audit=root/"audit";audit.mkdir(mode=0o700)
         token=secrets.token_hex(32);token_path=root/"token";token_path.write_text(token);token_path.chmod(0o600)
@@ -152,6 +152,21 @@ def main(agent,gateway,permissions=False):
             future=pool.submit(call,tool="fs_read",path="example.txt");item=wait_pending(state)
             assert item["arguments"]=={"path":"example.txt"};approve(state,item)
             result=future.result(20);assert result["isError"] is False and result["structuredContent"]["outcome"]["data"]["content"]==(repo/"example.txt").read_bytes().decode("utf-8"),result
+            # Native search is independently approved, including the exact query.
+            (repo/".gitignore").write_text("ignored.txt\n")
+            (repo/"ignored.txt").write_text("changed\n")
+            query={"mode":"text","pattern":"CHANG.D","regex":True,"limit":10}
+            future=pool.submit(call,tool="fs_search",query=query);item=wait_pending(state)
+            assert item["tool"]=="fs_search" and item["arguments"]=={"query":query}
+            assert not future.done()
+            approve(state,item)
+            result=future.result(20)
+            assert not result["isError"],result
+            hits=result["structuredContent"]["outcome"]["data"]["results"]
+            assert [h["path"] for h in hits]==["example.txt"],hits
+            future=pool.submit(call,tool="fs_search",query=query);item=wait_pending(state)
+            approve(state,item,"deny")
+            assert future.result(20)["isError"] is True
             # Closing the requesting client must stop pending execution.
             connection=http.client.HTTPSConnection("localhost",port,context=ssl.create_default_context(cafile=str(ca)),timeout=10)
             canceled_id=str(uuid.uuid4())
@@ -167,7 +182,10 @@ def main(agent,gateway,permissions=False):
             else: (repo/"escape").symlink_to(outside,target_is_directory=True)
             future=pool.submit(call,tool="fs_read",path="escape/secret.txt");item=wait_pending(state);approve(state,item)
             result=future.result(20);assert result["isError"] is True and "not shared" not in json.dumps(result),result
-            print("PASS: real MCP HTTPS/TLS lifecycle, genuine Git result, exact approval, wrong hash, denial, replay, revoke, service restart/recovery, scoped file read and junction escape rejection")
+            future=pool.submit(call,tool="fs_search",query={"mode":"paths","pattern":"secret"});item=wait_pending(state);approve(state,item)
+            result=future.result(20)
+            assert not result["isError"] and result["structuredContent"]["outcome"]["data"]["results"]==[],result
+            print("PASS: native approved search, ignore rules and junction rejection; real MCP HTTPS/TLS lifecycle, genuine Git result, exact approval, wrong hash, denial, replay, revoke, service restart/recovery, scoped file read and junction escape rejection")
         finally:
             for process in reversed(processes):
                 if process.poll() is None:process.terminate()
