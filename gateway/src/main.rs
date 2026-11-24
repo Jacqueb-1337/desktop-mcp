@@ -691,6 +691,7 @@ mod tests {
         use std::sync::{mpsc,atomic::{AtomicBool,Ordering}};
         #[cfg(windows)] let state=tempfile::tempdir_in(std::env::var_os("USERPROFILE").unwrap()).unwrap();
         #[cfg(not(windows))] let state=tempfile::tempdir().unwrap();
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(state.path(),fs::Permissions::from_mode(0o700)).unwrap(); }
         let key=SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let host=host_fingerprint(&key);
         let allowlist=state.path().join("allowlist.json");
