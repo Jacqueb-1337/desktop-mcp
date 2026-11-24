@@ -207,6 +207,7 @@ mod platform {
                 Err(_)=>return Err("WORKER_ACCEPT_FAILED".into())
             };
             s.set_nonblocking(false).map_err(|_|"WORKER_IO")?;
+            s.set_nodelay(true).map_err(|_|"WORKER_IO")?;
             s.set_read_timeout(Some(Duration::from_millis(500))).map_err(|_|"WORKER_IO")?;
             let mut hello=[0u8;65];
             if s.read_exact(&mut hello).is_err() || &hello[..64]!=nonce.as_bytes(){continue;}
@@ -227,6 +228,7 @@ mod platform {
         let connect=|role:u8|->Result<TcpStream,String>{
             let mut stream=TcpStream::connect_timeout(&SocketAddrV4::new(Ipv4Addr::LOCALHOST,port).into(),Duration::from_secs(3))
                 .map_err(|_|"WORKER_CONNECT_FAILED")?;
+            stream.set_nodelay(true).map_err(|_|"WORKER_IO")?;
             stream.set_write_timeout(Some(Duration::from_secs(8))).map_err(|_|"WORKER_IO")?;
             let mut hello=nonce.as_bytes().to_vec();hello.push(role);
             stream.write_all(&hello).map_err(|_|"WORKER_IO")?;

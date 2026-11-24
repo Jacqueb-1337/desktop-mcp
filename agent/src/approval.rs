@@ -469,7 +469,7 @@ mod tests {
         assert!(!inbox.consume(&f).unwrap());let id=f["request_id"].as_str().unwrap();let digest=fingerprint(&f).unwrap();
         inbox.decide(id,f["nonce"].as_str().unwrap(),&digest,"approve").unwrap();
         let mut changed=f.clone();changed["arguments"]=json!({"path":"outside"});assert!(inbox.consume(&changed).is_err());
-        let mut changed=f.clone();changed["expires_at"]=json!(epoch_seconds().unwrap()+99);assert!(inbox.consume(&changed).is_err());
+        let mut changed=f.clone();changed["expires_at"]=json!(f["expires_at"].as_u64().unwrap()-1);assert!(inbox.consume(&changed).is_err());
         assert!(inbox.consume(&f).unwrap());assert!(inbox.consume(&f).is_err());
         drop(inbox);let mut inbox=Inbox::open(dir.path(),host()).unwrap();assert!(inbox.stage(&f, None).is_err());assert!(inbox.consume(&f).is_err());
     }

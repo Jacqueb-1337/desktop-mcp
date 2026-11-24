@@ -215,17 +215,12 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 "next_offset":from+bytes.len() as u64,"end_offset":end,"truncated":requested<self.start})
         }
         fn save(&self, path: &Path) -> Result<(), String> {
-            let output: String = self
-                .output
-                .iter()
-                .flat_map(|byte| {
-                    let alphabet = b"0123456789abcdef";
-                    [
-                        alphabet[(byte >> 4) as usize] as char,
-                        alphabet[(byte & 15) as usize] as char,
-                    ]
-                })
-                .collect();
+            let (first,second)=self.output.as_slices();
+            let mut encoded=vec![0u8;self.output.len()*2];
+            let (left,right)=encoded.split_at_mut(first.len()*2);
+            hex::encode_to_slice(first,left).map_err(|_|"TERMINAL_OUTPUT_ENCODE")?;
+            hex::encode_to_slice(second,right).map_err(|_|"TERMINAL_OUTPUT_ENCODE")?;
+            let output=String::from_utf8(encoded).map_err(|_|"TERMINAL_OUTPUT_ENCODE")?;
             unattended::write_record(
                 path,
                 &json!({
@@ -365,11 +360,13 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
     struct Session {
         record: Arc<Mutex<Record>>,
         send: mpsc::SyncSender<Work>,
+        wake:mpsc::SyncSender<()>,
         stop: Arc<AtomicBool>,
     }
     impl Drop for Session {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
+            let _=self.wake.try_send(());
         }
     }
 
@@ -382,6 +379,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         pub fn close_all(&mut self) {
             for session in self.active.values() {
                 session.stop.store(true, Ordering::Release);
+                let _=session.wake.try_send(());
             }
         }
 
@@ -402,8 +400,12 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                     .is_ok_and(|record| record.closed_at.is_none())
             });
             let directory = state.join("terminal-history");
-            fs::create_dir_all(&directory).map_err(|_| "TERMINAL_HISTORY_UNAVAILABLE")?;
-            prune(&directory, &self.active);
+            // History cleanup is needed when opening/listing sessions, not
+            // for each read or command on a live terminal.
+            if matches!(tool,"terminal_open"|"terminal_list") {
+                fs::create_dir_all(&directory).map_err(|_| "TERMINAL_HISTORY_UNAVAILABLE")?;
+                prune(&directory, &self.active);
+            }
             if tool == "terminal_list" {
                 let mut items = Vec::new();
                 for session in self.active.values() {
@@ -451,6 +453,8 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 record.save(&path)?;
                 let record = Arc::new(Mutex::new(record));
                 let (send, receive) = mpsc::sync_channel(1);
+                let (wake,wakeup)=mpsc::sync_channel(1);
+                let worker_wake=wake.clone();
                 let stop = Arc::new(AtomicBool::new(false));
                 let worker = record.clone();
                 let worker_stop = stop.clone();
@@ -464,16 +468,16 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                             shell,
                             worker,
                             receive,
+                            worker_wake,
+                            wakeup,
                             worker_stop,
-                            state,
-                            host,
-                            grant,
-                            execution_scope,
+                            move || unattended::grant_id_for(&state, &host,execution_scope)==Some(grant)
+                                && state.join("remote-readonly.enabled").is_file(),
                             path,
                         )
                     })
                     .map_err(|_| "TERMINAL_WORKER_UNAVAILABLE")?;
-                self.active.insert(id, Session { record, send, stop });
+                self.active.insert(id, Session { record, send, wake, stop });
                 return Ok(json!({"terminal_id":id.to_string(),"visibility":"hidden","context":if execution_scope==crate::user_command::ELEVATED {"elevated_user"}else if execution_scope==crate::user_command::TOOL {"user"}else{"system"}}));
             }
             let id = Uuid::parse_str(args["terminal_id"].as_str().ok_or("TERMINAL_ID_REQUIRED")?)
@@ -490,6 +494,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                     "terminal_read" => Ok(record.read(args["offset"].as_u64())),
                     "terminal_close" => {
                         session.stop.store(true, Ordering::Release);
+                        let _=session.wake.try_send(());
                         Ok(json!({"closing":true}))
                     }
                     "terminal_run" => {
@@ -527,6 +532,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                             exit_code: None,
                             status: "running".into(),
                         });
+                        let _=session.wake.try_send(());
                         Ok(
                             json!({"terminal_id":id.to_string(),"command_id":command_id.to_string(),"status":"running"}),
                         )
@@ -603,7 +609,8 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         Ok((child, job))
     }
 
-    fn drain(stream: impl Read, output: mpsc::SyncSender<(bool, Vec<u8>)>, stdout: bool) {
+    fn drain(stream: impl Read, output: mpsc::SyncSender<(bool, Vec<u8>)>, stdout: bool,
+        wake:Option<mpsc::SyncSender<()>>) {
         let mut reader = BufReader::new(stream);
         loop {
             let mut bytes = Vec::new();
@@ -613,9 +620,11 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                     if output.send((stdout, bytes)).is_err() {
                         break;
                     }
+                    if let Some(wake)=&wake{let _=wake.try_send(());}
                 }
             }
         }
+        if let Some(wake)=wake{let _=wake.try_send(());}
     }
 
     enum Process {
@@ -661,11 +670,10 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         shell:Shell,
         record: Arc<Mutex<Record>>,
         receive: mpsc::Receiver<Work>,
+        wake:mpsc::SyncSender<()>,
+        wakeup:mpsc::Receiver<()>,
         stop: Arc<AtomicBool>,
-        state: PathBuf,
-        host: String,
-        grant: Uuid,
-        execution_scope:&'static str,
+        authorized: impl Fn() -> bool,
         path: PathBuf,
     ) {
         let Shell{mut process,job,mut input,stdout,stderr}=shell;
@@ -682,8 +690,9 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         });
         let (send, output) = mpsc::sync_channel(32);
         let stdout_send = send.clone();
-        let _ = thread::spawn(move || drain(stdout, stdout_send, true));
-        let _ = thread::spawn(move || drain(stderr, send, false));
+        let stdout_wake=wake.clone();
+        let _ = thread::spawn(move || drain(stdout, stdout_send, true,Some(stdout_wake)));
+        let _ = thread::spawn(move || drain(stderr, send, false,Some(wake)));
         let mut current: Option<(Uuid, Instant)> = None;
         let mut idle = Instant::now();
         let mut checkpoint = Instant::now();
@@ -692,9 +701,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
             if stop.load(Ordering::Acquire) {
                 break "closed";
             }
-            if unattended::grant_id_for(&state, &host,execution_scope) != Some(grant)
-                || !state.join("remote-readonly.enabled").is_file()
-            {
+            if !authorized() {
                 break "grant_inactive";
             }
             if current.is_some_and(|(_, until)| Instant::now() >= until) {
@@ -767,7 +774,9 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 checkpoint = Instant::now();
             }
             if drained < 32 {
-                thread::sleep(Duration::from_millis(100));
+                // Coalesced notifications wake on command submission, output,
+                // or close; keep the 100ms ceiling for grant/timeout checks.
+                let _=wakeup.recv_timeout(Duration::from_millis(100));
             }
         };
         drop(input_send);
@@ -794,12 +803,123 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
         use super::*;
 
         #[test]
+        fn worker_completion_latency_and_output() {
+            let tmp=tempfile::tempdir().unwrap();
+            let path=tmp.path().join("record.json");
+            let record=Arc::new(Mutex::new(Record{
+                id:Uuid::new_v4(),grant:Uuid::new_v4(),closed_at:None,reason:None,start:0,
+                output:VecDeque::new(),commands:VecDeque::new()
+            }));
+            let (send,receive)=mpsc::sync_channel(1);
+            let (wake,wakeup)=mpsc::sync_channel(1);
+            let stop=Arc::new(AtomicBool::new(false));
+            let shell=Shell::start(tmp.path(),crate::elevation::COMMAND).unwrap();
+            let worker={
+                let record=record.clone();let stop=stop.clone();let worker_wake=wake.clone();
+                thread::spawn(move||run(shell,record,receive,worker_wake,wakeup,stop,||true,path))
+            };
+            let mut samples=Vec::new();
+            for i in 0..11 {
+                let id=Uuid::new_v4();
+                let label=format!("latency_fixture_{i}");
+                let started=Instant::now();
+                {
+                    let mut entry=record.lock().unwrap();
+                    send.send(Work{id,command:format!("Write-Output '{label}'"),timeout:Duration::from_secs(10)}).unwrap();
+                    entry.commands.push_back(CommandRecord{id,exit_code:None,status:"running".into()});
+                    let _=wake.try_send(());
+                }
+                loop {
+                    assert!(started.elapsed()<Duration::from_secs(10),"worker did not finish");
+                    {
+                        let entry=record.lock().unwrap();
+                        if entry.commands.back().unwrap().status=="finished" {
+                            assert_eq!(entry.commands.back().unwrap().exit_code,Some(0));
+                            assert!(String::from_utf8_lossy(&entry.output.iter().copied().collect::<Vec<_>>()).contains(&label));
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if i>0{samples.push(started.elapsed().as_secs_f64()*1000.0);}
+                // Deliberately vary the phase relative to the old polling interval.
+                thread::sleep(Duration::from_millis(7+i*3));
+            }
+            samples.sort_by(f64::total_cmp);
+            println!("TERMINAL_BENCH median_ms={:.2} samples={samples:?}",samples[samples.len()/2]);
+            // Check a burst large enough to fill the bounded output channel.
+            let id=Uuid::new_v4();
+            {
+                let mut entry=record.lock().unwrap();
+                send.send(Work{id,command:"1..1200 | ForEach-Object { Write-Output ('burst_' + $_) }; & cmd.exe /c exit 7".into(),
+                    timeout:Duration::from_secs(10)}).unwrap();
+                entry.commands.push_back(CommandRecord{id,exit_code:None,status:"running".into()});
+                let _=wake.try_send(());
+            }
+            let deadline=Instant::now()+Duration::from_secs(10);
+            loop {
+                {
+                    let entry=record.lock().unwrap();
+                    if entry.commands.back().unwrap().status=="finished" {
+                        assert_eq!(entry.commands.back().unwrap().exit_code,Some(7));
+                        let text=String::from_utf8_lossy(&entry.output.iter().copied().collect::<Vec<_>>()).into_owned();
+                        assert_eq!(text.lines().filter(|line|line.starts_with("burst_")).count(),1200);
+                        assert!(text.contains("burst_1200"));
+                        break;
+                    }
+                }
+                assert!(Instant::now()<deadline,"burst did not finish");
+                thread::sleep(Duration::from_millis(1));
+            }
+            let closed=Instant::now();
+            stop.store(true,Ordering::Release);
+            let _=wake.try_send(());
+            worker.join().unwrap();
+            assert!(closed.elapsed()<Duration::from_secs(5));
+            let retained=load(&tmp.path().join("record.json")).unwrap();
+            assert_eq!(retained.commands.back().unwrap().exit_code,Some(7));
+            assert_eq!(retained.reason.as_deref(),Some("closed"));
+        }
+
+        #[test]
+        fn worker_wakes_and_stops_when_grant_revoked() {
+            let tmp=tempfile::tempdir().unwrap();
+            let record=Arc::new(Mutex::new(Record{id:Uuid::new_v4(),grant:Uuid::new_v4(),
+                closed_at:None,reason:None,start:0,output:VecDeque::new(),commands:VecDeque::new()}));
+            let (send,receive)=mpsc::sync_channel(1);
+            let (wake,wakeup)=mpsc::sync_channel(1);
+            let stop=Arc::new(AtomicBool::new(false));
+            let allowed=Arc::new(AtomicBool::new(true));
+            let shell=Shell::start(tmp.path(),crate::elevation::COMMAND).unwrap();
+            let worker={
+                let record=record.clone();let stop=stop.clone();let worker_wake=wake.clone();
+                let allowed=allowed.clone();let path=tmp.path().join("record.json");
+                thread::spawn(move||run(shell,record,receive,worker_wake,wakeup,stop,move||allowed.load(Ordering::Acquire),path))
+            };
+            let id=Uuid::new_v4();
+            {
+                let mut entry=record.lock().unwrap();
+                send.send(Work{id,command:"Start-Sleep -Seconds 30".into(),timeout:Duration::from_secs(60)}).unwrap();
+                entry.commands.push_back(CommandRecord{id,exit_code:None,status:"running".into()});
+                let _=wake.try_send(());
+            }
+            thread::sleep(Duration::from_millis(50));
+            let revoked=Instant::now();
+            allowed.store(false,Ordering::Release);
+            worker.join().unwrap();
+            assert!(revoked.elapsed()<Duration::from_secs(5));
+            let entry=record.lock().unwrap();
+            assert_eq!(entry.reason.as_deref(),Some("grant_inactive"));
+            assert_eq!(entry.commands.back().unwrap().status,"grant_inactive");
+        }
+
+        #[test]
         fn hidden_shell_reuses_environment_and_directory_and_reports_native_exit() {
             let (mut child, job) = start_shell().unwrap();
             let mut stdin = child.stdin.take().unwrap();
             let stdout = child.stdout.take().unwrap();
             let (sender, receiver) = mpsc::sync_channel(32);
-            let worker = thread::spawn(move || drain(stdout, sender, true));
+            let worker = thread::spawn(move || drain(stdout, sender, true,None));
             let send = |stdin: &mut std::process::ChildStdin, cmd: &str| {
                 let id = Uuid::new_v4();
                 let command = json!({"id":id.to_string(),"command":cmd}).to_string();
