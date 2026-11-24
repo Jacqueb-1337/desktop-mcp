@@ -26,6 +26,10 @@ struct PatchChange {
     new_content: Option<String>,
     #[serde(default)]
     edits: Option<Vec<TextEdit>>,
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    source_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +101,8 @@ struct Proposal {
     id: String,
     base_head: String,
     changes: Vec<Change>,
+    // Copy sources are read-only dependencies, checked again before apply.
+    sources: Vec<(String,String)>,
     diff: String,
     created: Instant,
     status: &'static str,
@@ -361,7 +367,7 @@ impl Agent {
             "list_hosts" => Ok(json!({"hosts":[{"host_id":"local","name":"Local computer","connected":true,"workspace_ids":["default"]}]})),
             "get_capabilities" => Ok(json!({
                 "host_id":"local", "workspace_id":"default",
-                "implemented":["gateway_info","list_hosts","get_capabilities","fs_read","fs_search","fs_list","git_status","git_diff",
+                "implemented":["gateway_info","list_hosts","get_capabilities","fs_read","fs_search","fs_list","fs_batch","git_status","git_diff",
                     "patch_prepare","patch_review","patch_apply","patch_status","git_commit_patch"],
                 "writes_enabled":self.allow_writes,
                 "remote_pairing":false,"admin":false,"shell":false
@@ -376,6 +382,7 @@ impl Agent {
                     },
                     "fs_search" => crate::search::search(&self.workspace,&args["query"]),
                     "fs_list" => crate::readonly::list_worker(&self.workspace,&args["query"]),
+                    "fs_batch" => crate::readonly::batch_worker(&self.workspace,&args["query"]),
                     "git_status" => self.git_status(),
                     "git_diff" => self.git_diff(args),
                     "git_snapshot" => self.git_snapshot(args),
@@ -482,10 +489,66 @@ impl Agent {
         if changes.is_empty() || changes.len() > 16 {
             return Err("INVALID_CHANGES: provide between 1 and 16 files".into());
         }
+        let mut expanded=Vec::new();
+        let mut sources=Vec::new();
+        let mut transfers=Vec::new();
+        let mut source_permissions=HashMap::new();
+        let mut reserved=HashSet::new();
+        let key=|s:&str|if cfg!(windows){s.to_lowercase()}else{s.to_owned()};
+        // Reject aliases and overlapping inputs. A transfer is always from a
+        // clean tracked text source to a new path in an existing directory.
+        for change in &changes {
+            if !crate::readonly::valid_read_path(&change.path)||!reserved.insert(key(&change.path)){
+                return Err("INVALID_OR_DUPLICATE_PATCH_PATH".into());
+            }
+        }
+        for mut change in changes {
+            if matches!(change.operation.as_str(),"copy"|"move"|"rename") {
+                if change.expected_sha256.is_some()||change.new_content.is_some()||change.edits.is_some(){
+                    return Err("TRANSFER_REQUIRES_NEW_DESTINATION".into());
+                }
+                let source=change.source_path.take().ok_or("SOURCE_PATH_REQUIRED")?;
+                let expected=change.source_sha256.take().ok_or("SOURCE_SHA256_REQUIRED")?;
+                if !crate::readonly::valid_read_path(&source)||!reserved.insert(key(&source)){
+                    return Err("INVALID_OR_OVERLAPPING_SOURCE".into());
+                }
+                let content=self.read_text(&source)?.ok_or("SOURCE_MISSING")?;
+                if content.contains(' ')||hash(content.as_bytes())!=expected {
+                    return Err("SOURCE_HASH_MISMATCH_OR_BINARY".into());
+                }
+                self.target_clean(&source)?;
+                let mode=if self.desktop_mode {
+                    git2::Repository::open_ext(&self.workspace,git2::RepositoryOpenFlags::NO_SEARCH,std::iter::empty::<&Path>())
+                        .map_err(|_|"REPOSITORY_INVALID")?.index().map_err(|_|"GIT_INDEX_UNAVAILABLE")?
+                        .get_path(Path::new(&source),0).map(|e|e.mode)
+                }else{
+                    let output=git(&self.workspace,&["ls-files","--stage","--",&source],None)?;
+                    output.split_whitespace().next().and_then(|s|u32::from_str_radix(s,8).ok())
+                };
+                // Existing patch commit logic creates ordinary 100644 files.
+                // Refuse executable/special sources rather than lose mode bits.
+                if mode!=Some(0o100644){return Err("TRANSFER_REQUIRES_TRACKED_NONEXECUTABLE_TEXT".into());}
+                source_permissions.insert(change.path.clone(),fs::metadata(self.path(&source)?).map_err(|_|"SOURCE_METADATA_FAILED")?.permissions());
+                let moving=change.operation!="copy";
+                transfers.push(json!({"operation":change.operation,"source":source,"destination":change.path,"sha256":expected}));
+                sources.push((source.clone(),expected.clone()));
+                change.operation="create".into();
+                change.new_content=Some(content);
+                expanded.push(change);
+                if moving {
+                    expanded.push(PatchChange{path:source,operation:"delete".into(),expected_sha256:Some(expected),
+                        new_content:None,edits:None,source_path:None,source_sha256:None});
+                }
+            }else{
+                if change.source_path.is_some()||change.source_sha256.is_some(){return Err("UNEXPECTED_TRANSFER_SOURCE".into());}
+                expanded.push(change);
+            }
+        }
+        if expanded.len()>16{return Err("PATCH_EXPANDED_PATH_LIMIT_16".into());}
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
         let mut diff = String::new();
-        for mut requested in changes {
+        for mut requested in expanded {
             if !seen.insert(requested.path.clone()) {
                 return Err(format!("DUPLICATE_PATH: {}",requested.path));
             }
@@ -536,20 +599,23 @@ impl Agent {
             let after = requested.new_content.as_deref().unwrap_or("");
             let old_name = if current.is_some() {format!("a/{}",requested.path)} else {"/dev/null".into()};
             let new_name = if requested.new_content.is_some() {format!("b/{}",requested.path)} else {"/dev/null".into()};
-            let text_diff = TextDiff::from_lines(before, after)
-                .unified_diff()
-                .context_radius(3)
-                .header(&old_name,&new_name)
-                .to_string();
-            diff.push_str(&text_diff);
-            diff.push('\n');
+            // Transfers are represented by exact paths and content hashes,
+            // not a duplicate full-file addition/deletion diff.
+            if !transfers.iter().any(|t|t["destination"]==requested.path ||
+                (t["operation"]!="copy" && t["source"]==requested.path)) {
+                let text_diff = TextDiff::from_lines(before, after)
+                    .unified_diff().context_radius(3).header(&old_name,&new_name).to_string();
+                diff.push_str(&text_diff);
+                diff.push('\n');
+            }
+            let permissions=if path.exists() { Some(fs::metadata(path).map_err(|e|e.to_string())?.permissions()) } else { source_permissions.remove(&requested.path) };
             entries.push(Change{
                 path: requested.path,
                 old_content: current,
                 new_sha256: requested.new_content.as_ref().map(|c|hash(c.as_bytes())),
                 new_content: requested.new_content,
                 old_sha256: current_sha,
-                permissions: if path.exists() { Some(fs::metadata(path).map_err(|e|e.to_string())?.permissions()) } else { None }
+                permissions
             });
         }
         if self.proposals.len() >= MAX_PATCHES {
@@ -558,12 +624,15 @@ impl Agent {
                 return Err("TOO_MANY_PROPOSALS: finish or restart session".into());
             }
         }
+        for t in &transfers {
+            diff.push_str(&format!("{} {} -> {} (SHA-256 {})\n",t["operation"].as_str().unwrap(),t["source"].as_str().unwrap(),t["destination"].as_str().unwrap(),t["sha256"].as_str().unwrap()));
+        }
         // Keep replies below MCP ingress and broker output limits.
         if diff.len() > 24000 { return Err("PATCH_DIFF_TOO_LARGE: split into smaller patches".into()); }
         let id = Uuid::new_v4().to_string();
         let count = entries.len();
         self.proposals.insert(id.clone(), Proposal {
-            id: id.clone(), base_head: head.clone(), changes: entries,
+            id: id.clone(), base_head: head.clone(), changes: entries, sources,
             diff: diff.clone(), created: Instant::now(), status:"prepared",commit:None
         });
         Ok(json!({"status":"prepared","patch_id":id,"base_head":head,"files_changed":count,
@@ -611,6 +680,12 @@ impl Agent {
             return Err("STALE_HEAD: repository changed after review".into());
         }
         let changes = p.changes.clone();
+        for (source,expected) in &p.sources {
+            if self.read_text(source)?.as_ref().map(|c|hash(c.as_bytes())).as_ref()!=Some(expected){
+                return Err(format!("TRANSFER_SOURCE_CHANGED: {source}"));
+            }
+            self.target_clean(source)?;
+        }
         for change in &changes {
             let current = self.read_text(&change.path)?;
             if current.as_ref().map(|c|hash(c.as_bytes())) != change.old_sha256 {
@@ -855,6 +930,27 @@ mod tests {
         assert_eq!(agent.authorization_scope(),state.path().canonicalize().unwrap());
         let restarted=Agent::new_desktop(state.path()).unwrap();
         assert_eq!(restarted.root(),folder.path().canonicalize().unwrap());
+    }
+    #[test]
+    fn reviewed_transfer_rejects_existing_destination_overlap_and_stale_hash() {
+        let state=TempDir::new().unwrap();
+        let folder=TempDir::new().unwrap();
+        fs::write(folder.path().join("original.txt"),"original\n").unwrap();
+        fs::write(folder.path().join("existing.txt"),"existing\n").unwrap();
+        let mut agent=Agent::new_desktop(state.path()).unwrap();
+        agent.use_repository(folder.path().to_str().unwrap(),true).unwrap();
+        let base=agent.dispatch("git_snapshot",&json!({"host_id":"local","workspace_id":"default",
+            "paths":["original.txt","existing.txt"],"message":"Fixture"})).unwrap();
+        let request=|dest:&str,sha:&str|json!({"host_id":"local","workspace_id":"default","expected_head":base["commit"],
+            "changes":[{"path":dest,"operation":"move","expected_sha256":null,"new_content":null,
+                "source_path":"original.txt","source_sha256":sha}]});
+        let sha=hash(b"original\n");
+        for (dest,expected) in [("existing.txt",sha.as_str()),("original.txt",sha.as_str()),("../outside",sha.as_str()),("new.txt","wrong")]{
+            assert!(agent.dispatch("patch_prepare",&request(dest,expected)).is_err(),"{dest}");
+        }
+        assert_eq!(fs::read_to_string(folder.path().join("original.txt")).unwrap(),"original\n");
+        assert_eq!(fs::read_to_string(folder.path().join("existing.txt")).unwrap(),"existing\n");
+        assert!(!folder.path().join("new.txt").exists());
     }
     #[test]
     fn standalone_desktop_snapshot_patch_and_commit_preserve_history() {

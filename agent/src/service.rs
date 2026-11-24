@@ -346,6 +346,11 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 }
+                if tool=="fs_batch" && policy.require_pairing_consent &&
+                    !route["arguments"]["query"].as_array().is_some_and(|items|items.iter().all(|item|
+                        item["tool"].as_str().is_some_and(|name|inbox.has_permission(name,path)))) {
+                    return json!({"error":"BATCH_SUBTOOL_PERMISSION_REQUIRED"});
+                }
                 None
             };
             inbox.stage(route, scope).unwrap_or_else(|error|json!({"error":error}))
@@ -460,6 +465,11 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     return result;
                 }
             }
+            if tool=="fs_batch" && policy.require_pairing_consent &&
+                !frame["arguments"]["query"].as_array().is_some_and(|items|items.iter().all(|item|
+                    item["tool"].as_str().is_some_and(|name|inbox.has_permission(name,path)))) {
+                return json!({"pending":false,"executed":false,"error":"BATCH_SUBTOOL_PERMISSION_REQUIRED"});
+            }
             match inbox.consume(frame) {
                 Ok(false)=>json!({"pending":true}),
                 Ok(true) if elevation::is_privileged(tool) => match elevation::Run::start(frame, agent.root()) {
@@ -491,6 +501,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     "fs_search"=>policy.search_worker.query(agent.root(),&frame["arguments"]),
                     "fs_read"=>crate::readonly::fs_read(agent.root(),&frame["arguments"]),
                     "fs_list"=>crate::readonly::fs_list(agent.root(),&frame["arguments"]),
+                    "fs_batch"=>crate::readonly::fs_batch(agent.root(),&frame["arguments"]),
                     "git_diff"=>crate::readonly::git_diff(agent.root(),&frame["arguments"]),
                     _=>Err("UNSUPPORTED_READ_TOOL".into())
                 } {

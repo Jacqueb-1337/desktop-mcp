@@ -222,14 +222,22 @@ impl Broker {
             workspace_id: "default".into(),
             tool: tool.into(),
         };
-        if !matches!(tool, "git_status" | "fs_read" | "fs_search" | "fs_list" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result" | "elevated_user_command" | "elevated_user_command_result") && !terminal_tool(tool)
+        if !matches!(tool, "git_status" | "fs_read" | "fs_search" | "fs_list" | "fs_batch" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result" | "elevated_user_command" | "elevated_user_command_result") && !terminal_tool(tool)
             || self.policy_decision(&intent, host) != Decision::RequiresLocalApproval
         {
             return Err("POLICY_DENIED".into());
         }
+        if tool=="fs_batch" {
+            if !crate::policy::valid_batch_query(&args["query"]){return Err("INVALID_BATCH_QUERY".into());}
+            for item in args["query"].as_array().unwrap(){
+                let mut scope=intent.clone();
+                scope.tool=item["tool"].as_str().unwrap().to_owned();
+                if self.policy_decision(&scope,host)!=Decision::RequiresLocalApproval{return Err("BATCH_SUBTOOL_POLICY_DENIED".into());}
+            }
+        }
         if tool == "request_permission" {
             let capability = args["capability"].as_str().ok_or("CAPABILITY_REQUIRED")?;
-            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "fs_search" | "fs_list" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command" | "elevated_user_command")
+            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "fs_search" | "fs_list" | "fs_batch" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command" | "elevated_user_command")
                 || !args["duration"].as_str().is_some_and(crate::policy::valid_duration)
             {
                 return Err("INVALID_PERMISSION_REQUEST".into());
@@ -265,7 +273,7 @@ impl Broker {
                 for key in ["start_line","end_line"] {if let Some(value)=args.get(key){payload[key]=value.clone();}}
                 payload
             },
-            "fs_search"|"fs_list"|"git_diff" => json!({"query":args["query"]}),
+            "fs_search"|"fs_list"|"fs_batch"|"git_diff" => json!({"query":args["query"]}),
             "use_repository" => json!({"path":args["path"],"initialize":args["initialize"]}),
             "git_snapshot" => json!({"paths":args["paths"],"message":args["message"]}),
             "patch_prepare" => json!({"expected_head":args["expected_head"],"changes":args["changes"]}),
@@ -400,6 +408,26 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
+    #[test]
+    fn batch_cannot_bypass_individual_gateway_capabilities() {
+        #[cfg(windows)] let state=tempfile::tempdir_in(std::env::var_os("USERPROFILE").unwrap()).unwrap();
+        #[cfg(not(windows))] let state=tempfile::tempdir().unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(state.path(),fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let host="ab".repeat(16);
+        let broker=Broker::new(PolicyFile{version:1,hosts:vec![HostScope{
+            host_id:host.clone(),workspace_id:"default".into(),tools:vec!["fs_batch".into(),"git_status".into()]
+        }]},Audit::open(state.path()).unwrap(),state.path()).unwrap();
+        let args=json!({"host_id":host,"workspace_id":"default","query":[
+            {"tool":"git_status","arguments":{}},
+            {"tool":"fs_read","arguments":{"path":"example.txt"}}]});
+        assert_eq!(broker.call("fs_batch",&args,&||true).unwrap_err(),"BATCH_SUBTOOL_POLICY_DENIED");
+        let invalid=json!({"host_id":host,"workspace_id":"default","query":[
+            {"tool":"admin_command","arguments":{"command":"Write-Output 1"}}]});
+        assert_eq!(broker.call("fs_batch",&invalid,&||true).unwrap_err(),"INVALID_BATCH_QUERY");
+    }
     #[test]
     fn setup_code_registers_only_the_expected_host_and_persists() {
         #[cfg(windows)] let state=tempfile::tempdir_in(std::env::var_os("USERPROFILE").unwrap()).unwrap();

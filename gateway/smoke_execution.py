@@ -3,6 +3,7 @@
 Test automation approves only its disposable repository, never a real workspace.
 """
 import concurrent.futures
+import contextlib
 import hashlib
 import http.client
 import json
@@ -30,8 +31,12 @@ def approve(state,item,decision="approve"):
     return local_call(state,"approval_decide",request_id=item["request_id"],nonce=item["nonce"],request_hash=item["request_hash"],decision=decision)
 
 def main(agent,gateway,permissions=False):
-    with tempfile.TemporaryDirectory(prefix="desktop-mcp-execution-",dir=Path.home() if os.name=="nt" else None) as tmp:
-        root=Path(tmp);state,repo,identity=setup_agent(agent,root)
+    with contextlib.ExitStack() as stack:
+        root=Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="desktop-mcp-execution-",dir=Path.home() if os.name=="nt" else None)))
+        share=os.environ.get("DMCP_SMOKE_REPO_PARENT")
+        repo_parent=Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="desktop-mcp-test-",dir=share))) if share else None
+        state,repo,identity=setup_agent(agent,root,repo_parent=repo_parent)
+        print("Fixture repository:",repo,flush=True)
         ca,cert,key=make_certs(root)
         identities = [identity]
         if permissions:
@@ -40,7 +45,7 @@ def main(agent,gateway,permissions=False):
             _, _, other_identity = setup_agent(agent, other_root)
             identities.append(other_identity)
         allowed=root/"allowlist.json";allowed.write_text(json.dumps({"version":1,"hosts":[{"host_id":item["host_id"],"public_key":item["public_key"]} for item in identities]}))
-        tools = ["git_status", "fs_read", "fs_search", "fs_list", "git_diff", "patch_prepare", "patch_review", "patch_apply", "git_commit_patch"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
+        tools = ["git_status", "fs_read", "fs_search", "fs_list", "git_diff", "fs_batch", "patch_prepare", "patch_review", "patch_apply", "git_commit_patch"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
         policy=root/"policy.json";policy.write_text(json.dumps({"version":1,"hosts":[{"host_id":identity["host_id"],"workspace_id":"default","tools":tools}]}))
         audit=root/"audit";audit.mkdir(mode=0o700)
         token=secrets.token_hex(32);token_path=root/"token";token_path.write_text(token);token_path.chmod(0o600)
@@ -119,6 +124,18 @@ def main(agent,gateway,permissions=False):
                 grant("fs_read", "permanent", "deny")
                 assert call(tool="fs_read", path="example.txt")["structuredContent"]["outcome"]["error"] == "LOCAL_PERMISSION_REQUIRED"
                 grant("git_status", "permanent")
+                grant("fs_batch", "permanent")
+                denied_batch=call(tool="fs_batch",query=[{"tool":"git_status","arguments":{}},
+                    {"tool":"fs_read","arguments":{"path":"example.txt"}}])
+                assert denied_batch["isError"],denied_batch
+                assert denied_batch["structuredContent"]["outcome"]["error"]=="BATCH_SUBTOOL_PERMISSION_REQUIRED",denied_batch
+                assert local_call(state,"approval_list")["pending"]==[]
+                allowed_batch=[{"tool":"git_status","arguments":{}}]
+                future=pool.submit(call,tool="fs_batch",query=allowed_batch)
+                item=wait_pending(state)
+                assert item["arguments"]=={"query":allowed_batch} and not future.done()
+                approve(state,item)
+                assert not future.result(20)["isError"]
                 service,_=restart_local_service(service,agent,repo,state,True,require_pairing_consent=True);processes.append(service)
                 future=pool.submit(call);item=wait_pending(state)
                 assert item["tool"] == "git_status" and not future.done()
@@ -182,7 +199,10 @@ def main(agent,gateway,permissions=False):
             # Windows junction escape must fail even after an exact local approval.
             outside=root/"outside";outside.mkdir();(outside/"secret.txt").write_text("not shared")
             if os.name=="nt":
-                subprocess.run(["cmd","/c","mklink","/J",str(repo/"escape"),str(outside)],capture_output=True,check=True)
+                link=subprocess.run(["cmd","/c","mklink","/J",str(repo/"escape"),str(outside)],capture_output=True)
+                if link.returncode:
+                    if not share: link.check_returncode()
+                    print("SMB does not support this junction fixture; exercising absent-path rejection here; local NTFS test still checks real junctions.",flush=True)
             else: (repo/"escape").symlink_to(outside,target_is_directory=True)
             future=pool.submit(call,tool="fs_read",path="escape/secret.txt");item=wait_pending(state);approve(state,item)
             result=future.result(20);assert result["isError"] is True and "not shared" not in json.dumps(result),result
@@ -277,6 +297,46 @@ def main(agent,gateway,permissions=False):
             committed=approved("git_commit_patch",patch_id=patch_id,message="Targeted edit smoke")
             assert committed["status"]=="committed"
             assert (repo/"example.txt").read_text()=="changed\n"
+            # Batch read jobs have one exact approval, individual results, and no writes.
+            batch_query=[{"tool":"fs_read","arguments":{"path":"large.txt","start_line":1801,"end_line":1801}},
+                {"tool":"fs_list","arguments":{"path":"nested"}},
+                {"tool":"git_diff","arguments":{"path":"example.txt"}},
+                {"tool":"fs_read","arguments":{"path":"missing.txt"}}]
+            batch=approved("fs_batch",query=batch_query)
+            assert batch["count"]==4 and [x["index"] for x in batch["results"]]==list(range(4)),batch
+            assert batch["results"][0]["data"]["content"]=="patched needle\n",batch
+            assert batch["results"][1]["data"]["entries"][0]["path"]=="nested/sample.txt",batch
+            assert batch["results"][2]["data"]["changed"] and batch["results"][3]["error"],batch
+            # Native copy, move and rename use the same reviewed patch lifecycle.
+            source=approved("fs_read",path="large.txt",start_line=1801,end_line=1801)
+            content=(repo/"large.txt").read_bytes()
+            def transfer(op,src,dest,head,sha):
+                return [{"path":dest,"operation":op,"expected_sha256":None,"new_content":None,
+                    "source_path":src,"source_sha256":sha}]
+            copy=transfer("copy","large.txt","nested/copied.txt",source["head"],source["sha256"])
+            proposal=approved("patch_prepare",expected_head=source["head"],changes=copy)
+            assert not (repo/"nested/copied.txt").exists()
+            review=approved("patch_review",patch_id=proposal["patch_id"])
+            assert "copy large.txt -> nested/copied.txt" in review["diff"] and source["sha256"] in review["diff"],review
+            # Changed source must fail, even though it is not a destination.
+            (repo/"large.txt").write_bytes(content+b"external change\n")
+            future=pool.submit(call,tool="patch_apply",patch_id=proposal["patch_id"])
+            item=wait_pending(state);approve(state,item)
+            assert future.result(20)["isError"] and not (repo/"nested/copied.txt").exists()
+            (repo/"large.txt").write_bytes(content)
+            approved("patch_apply",patch_id=proposal["patch_id"])
+            assert (repo/"nested/copied.txt").read_bytes()==content and (repo/"large.txt").exists()
+            cp=approved("git_commit_patch",patch_id=proposal["patch_id"],message="Copy fixture")
+            for operation,src,dest in [("move","nested/copied.txt","copied.txt"),("rename","copied.txt","renamed.txt")]:
+                plan=approved("patch_prepare",expected_head=cp["commit"],changes=transfer(operation,src,dest,cp["commit"],source["sha256"]))
+                assert (repo/src).exists() and not (repo/dest).exists()
+                review=approved("patch_review",patch_id=plan["patch_id"])
+                assert operation+" "+src+" -> "+dest in review["diff"],review
+                approved("patch_apply",patch_id=plan["patch_id"])
+                assert not (repo/src).exists() and (repo/dest).read_bytes()==content
+                cp=approved("git_commit_patch",patch_id=plan["patch_id"],message=operation+" fixture")
+            assert (repo/"example.txt").read_text()=="changed\n"
+            print("PASS: ordered batch results with per-item errors, copy/move/rename review, stale source rejection, apply and commit")
             paths={"mode":"paths","pattern":"large.txt","engine":"native"}
             cold=approved("fs_search",query={**paths,"refresh":True})
             assert cold["results"]==[{"path":"large.txt"}] and cold["index_hit"] is False,cold

@@ -59,3 +59,7 @@ the shell and its process tree. Idle shells close after 30 minutes.
 The four-terminal limit applies to persistent shells. admin_command remains
 available for short tasks, and admin_command_result retrieves its retained result
 by request ID for up to 24 hours under the same active grant.
+
+## Repository development tools
+
+On an explicitly configured repository-capable agent, the host policy can allow fs_read, fs_search, fs_list, git_diff, git_status, fs_batch, and the reviewed patch tools. Keep the existing paired fallback policy unchanged; configure only the capabilities the owner intends to grant. fs_batch also requires every constituent tool in the host policy and, when local capability grants are required, each constituent local grant. The batch still requires exact request approval. See agent/README.md for request shapes and limitations. The Windows protected SYSTEM command service is not automatically granted repository access by these additions.

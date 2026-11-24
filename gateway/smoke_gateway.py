@@ -18,11 +18,25 @@ def run(*args):
         args = (str(openssl), *args[1:])
     return subprocess.run(args, capture_output=True, text=True, check=True)
 
-def setup_agent(agent, root):
-    repo = root / "repo"
+def setup_agent(agent, root, repo_parent=None):
+    repo = (repo_parent if repo_parent is not None else root) / "repo"
     state = root / "state"
     repo.mkdir()
     state.mkdir(mode=0o700)
+    if repo_parent is not None and os.name=="nt":
+        # This is a fresh test-only repository on a user-selected SMB share.
+        # Git for Windows resolves mapped drives to UNC paths.
+        resolved=repo.resolve().as_posix()
+        if resolved.startswith("//?/UNC/"): resolved="//"+resolved[len("//?/UNC/"):]
+        elif resolved.startswith("//?/"): resolved=resolved[4:]
+        # Isolated home for this test process and its children; no persistent
+        # user Git config changes and no wildcard ownership exception.
+        home=root/"git-test-home"
+        home.mkdir()
+        os.environ["HOME"]=str(home)
+        os.environ["XDG_CONFIG_HOME"]=str(home/"xdg")
+        run("git","config","--global","--add","safe.directory","%(prefix)/"+resolved if resolved.startswith("//") else resolved)
+        run("git","config","--global","--add","safe.directory",repo.as_posix())
     run("git", "init", "-q", str(repo))
     run("git", "-C", str(repo), "config", "user.name", "Gateway Test")
     run("git", "-C", str(repo), "config", "user.email", "smoke@example.invalid")

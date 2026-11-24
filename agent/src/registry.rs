@@ -55,7 +55,7 @@ const RESERVED: &[&str] = &[
 ];
 
 const IMPLEMENTED: &[&str] = &[
-    "gateway_info", "list_hosts", "get_capabilities", "fs_read", "fs_search", "fs_list",
+    "gateway_info", "list_hosts", "get_capabilities", "fs_read", "fs_search", "fs_list", "fs_batch",
     "git_status", "git_diff", "patch_prepare", "patch_review",
     "patch_apply", "patch_status", "git_commit_patch"
 ];
@@ -96,6 +96,12 @@ fn implemented(name: &str) -> Value {
             tool(name,"Read a bounded UTF-8 line page with full-file SHA-256 and Git HEAD.",
                  schema(p,&["host_id","workspace_id","path"]),true)
         },
+        "fs_batch" => {
+            p["query"]=json!({"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","additionalProperties":false,
+                "properties":{"tool":{"enum":["fs_read","fs_list","fs_search","git_diff","git_status"]},"arguments":{"type":"object"}},
+                "required":["tool","arguments"]}});
+            tool(name,"Bounded independent read-only operations in one request.",schema(p,&["host_id","workspace_id","query"]),true)
+        },
         "fs_list" => {
             p["query"]=json!({"type":"object","additionalProperties":false,"properties":{
                 "path":{"type":"string","default":"."},"depth":{"type":"integer","minimum":1,"maximum":5},
@@ -129,8 +135,10 @@ fn implemented(name: &str) -> Value {
                 "items":{"type":"object","additionalProperties":false,
                     "properties":{
                         "path":{"type":"string"},
-                        "operation":{"type":"string","enum":["create","modify","delete"]},
+                        "operation":{"type":"string","enum":["create","modify","delete","copy","move","rename"]},
                         "expected_sha256":{"type":["string","null"]},
+                        "source_path":{"type":"string","description":"Copy/move/rename source; destination is path, expected_sha256 and new_content must be null."},
+                        "source_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},
                         "new_content":{"type":["string","null"]},
         "edits":{"type":"array","minItems":1,"maxItems":32,
           "description":"Optional sequential targeted edits for modify; set new_content to null. Exact text must occur once. Lines are 1-based inclusive; replacement includes any desired line terminator.",

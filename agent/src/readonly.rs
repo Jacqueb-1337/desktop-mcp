@@ -234,6 +234,19 @@ pub fn ranged_read_worker(root:&Path,args:&Value)->Result<Value,String> {
         "total_lines":total,"next_start_line":if last<total {Some(last+1)}else{None},
         "truncated":last<end.min(total)}))
 }
+pub fn valid_batch_query(query:&Value)->bool{
+    query.as_array().is_some_and(|items|!items.is_empty()&&items.len()<=4&&items.iter().all(|item|{
+        item.as_object().is_some_and(|o|o.len()==2&&o.contains_key("tool")&&o.contains_key("arguments")) &&
+        match item["tool"].as_str(){
+            Some("fs_read")=>valid_read_args(&item["arguments"]),
+            Some("fs_list")=>valid_list_query(&item["arguments"]),
+            Some("git_diff")=>valid_diff_query(&item["arguments"]),
+            Some("fs_search")=>crate::search::valid_query(&item["arguments"]),
+            Some("git_status")=>item["arguments"]==json!({}),
+            _=>false
+        }
+    })) && serde_json::to_vec(query).is_ok_and(|v|v.len()<=12000)
+}
 pub fn valid_list_query(query:&Value)->bool {
     query.as_object().is_some_and(|o|
         o.keys().all(|k|matches!(k.as_str(),"path"|"depth"|"limit"|"offset"))
@@ -279,16 +292,43 @@ pub fn list_worker(root:&Path,query:&Value)->Result<Value,String>{
     'walk: while let Some((parent,level))=pending.pop(){
         let handle=if parent.is_empty(){dir.try_clone()}else{dir.open_dir(&parent)};
         let handle=match handle{Ok(h)=>h,Err(_) if level>0=>{skipped+=1;continue;},Err(_)=>return Err("LIST_REQUIRES_DIRECTORY".into())};
-        let items=match handle.entries(){Ok(v)=>v,Err(_) if level>0=>{skipped+=1;continue;},Err(_)=>return Err("LIST_DIRECTORY_FAILED".into())};
+        let items:Box<dyn Iterator<Item=std::io::Result<std::ffi::OsString>>> =
+            match handle.entries() {
+                Ok(v)=>Box::new(v.map(|item|item.map(|e|e.file_name()))),
+                Err(_) => {
+                    // Some Windows SMB servers do not implement the directory
+                    // information class used by cap-std. Enumerate names via
+                    // the ordinary Windows directory API, but accept entries
+                    // only after rechecking them against the opened capability.
+                    #[cfg(windows)]
+                    {
+                        use std::path::{Component,Prefix};
+                        let network=matches!(root.components().next(),Some(Component::Prefix(p))
+                            if matches!(p.kind(),Prefix::UNC(..)|Prefix::VerbatimUNC(..)));
+                        let target=root.join(&parent);
+                        if !network || target.canonicalize().ok().as_deref()!=Some(target.as_path())
+                            || (!parent.is_empty() && check_components(root,&parent,false).is_err()) {
+                            if level>0{skipped+=1;continue;}else{return Err("LIST_DIRECTORY_FAILED".into());}
+                        }
+                        match fs::read_dir(&target) {
+                            Ok(v)=>Box::new(v.map(|item|item.map(|e|e.file_name()))),
+                            Err(_) if level>0=>{skipped+=1;continue;},
+                            Err(_)=>return Err("LIST_DIRECTORY_FAILED".into()),
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {if level>0{skipped+=1;continue;}else{return Err("LIST_DIRECTORY_FAILED".into());}}
+                }
+            };
         for item in items {
             if Instant::now()>=deadline || scanned>=20000 {exhausted=true;break 'walk;}
             scanned+=1;
-            let Ok(item)=item else{skipped+=1;continue;};
-            let name=item.file_name();
+            let Ok(name)=item else{skipped+=1;continue;};
             let Some(name)=name.to_str()else{skipped+=1;continue;};
             let relative=if parent.is_empty(){name.to_owned()}else{format!("{parent}/{name}")};
             if !valid_read_path(&relative)||check_components(root,&relative,false).is_err(){skipped+=1;continue;}
-            let Ok(meta)=item.metadata()else{skipped+=1;continue;};
+            let Ok(meta)=handle.symlink_metadata(name)else{skipped+=1;continue;};
+            if meta.file_type().is_symlink(){skipped+=1;continue;}
             if !meta.is_dir()&&!meta.is_file(){skipped+=1;continue;}
             if meta.is_dir()&&level+1<depth{pending.push((relative.clone(),level+1));}
             entries.push((relative,meta.is_dir(),meta.len()));
@@ -386,6 +426,46 @@ pub fn diff_worker(root:&Path,query:&Value)->Result<Value,String>{
         "old_exists":old_exists,"new_exists":new_exists,"binary":binary,"diff":diff,"truncated":truncated,
         "old_bytes":a.len(),"new_bytes":b.len()}))
 }
+pub fn batch_worker(root:&Path,query:&Value)->Result<Value,String>{
+    validate_root(root)?;
+    if !valid_batch_query(query){return Err("INVALID_BATCH_QUERY".into());}
+    let items=query.as_array().unwrap();
+    // A single isolated process, at most four bounded read jobs. Each error
+    // stays local to its item, with stable input-order results.
+    let results=thread::scope(|scope|{
+        let handles:Vec<_>=items.iter().map(|item|scope.spawn(move||{
+            let args=&item["arguments"];
+            match item["tool"].as_str().unwrap(){
+                "fs_read"=>ranged_read_worker(root,args),
+                "fs_list"=>list_worker(root,args),
+                "git_diff"=>diff_worker(root,args),
+                "fs_search"=>crate::search::search(root,args),
+                "git_status"=>status_worker(root),
+                _=>Err("INVALID_BATCH_TOOL".into())
+            }
+        })).collect();
+        handles.into_iter().map(|h|h.join().unwrap_or_else(|_|Err("BATCH_WORKER_FAILED".into()))).collect::<Vec<_>>()
+    });
+    let mut entries=Vec::new();
+    let mut bytes=0usize;
+    for (i,result) in results.into_iter().enumerate(){
+        let mut entry=match result{
+            Ok(data)=>json!({"index":i,"tool":items[i]["tool"],"data":data}),
+            Err(error)=>json!({"index":i,"tool":items[i]["tool"],"error":error})
+        };
+        let n=serde_json::to_vec(&entry).map_err(|_|"BATCH_ENCODING_FAILED")?.len();
+        if bytes+n>46000{
+            entry=json!({"index":i,"tool":items[i]["tool"],"error":"BATCH_OUTPUT_LIMIT_RETRY_INDIVIDUALLY"});
+        }
+        bytes+=serde_json::to_vec(&entry).map_err(|_|"BATCH_ENCODING_FAILED")?.len();
+        entries.push(entry);
+    }
+    Ok(json!({"results":entries,"count":items.len()}))
+}
+pub fn fs_batch(root:&Path,args:&Value)->Result<Value,String>{
+    if args.as_object().is_none_or(|o|o.len()!=1)||!valid_batch_query(&args["query"]){return Err("INVALID_BATCH_QUERY".into());}
+    run_worker(root,"--readonly-batch-worker",Some(&args["query"].to_string()))
+}
 pub fn fs_list(root:&Path,args:&Value)->Result<Value,String>{
     if args.as_object().is_none_or(|o|o.len()!=1)||!valid_list_query(&args["query"]){return Err("INVALID_LIST_QUERY".into());}
     run_worker(root,"--readonly-list-worker",Some(&args["query"].to_string()))
@@ -457,6 +537,12 @@ impl SearchSession {
         let mut command=Command::new(executable);
         command.env_clear().args(["--readonly-search-session","--workspace"]).arg(root)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        // Keep only profile location hints needed for Git's user-owned
+        // configuration (including exact safe.directory entries).
+        // Do not inherit Git overrides, hooks, credentials or arbitrary env.
+        for key in ["HOME","USERPROFILE","HOMEDRIVE","HOMEPATH","XDG_CONFIG_HOME"] {
+            if let Some(value)=std::env::var_os(key) { command.env(key,value); }
+        }
         #[cfg(windows)] {
             use std::os::windows::process::CommandExt;
             command.env("SystemRoot",std::env::var_os("SystemRoot").ok_or("SYSTEM_ROOT_UNAVAILABLE")?);
@@ -495,6 +581,9 @@ fn run_worker(root: &Path, mode: &str, path: Option<&str>) -> Result<Value, Stri
             "--workspace",
         ])
         .arg(root);
+    for key in ["HOME","USERPROFILE","HOMEDRIVE","HOMEPATH","XDG_CONFIG_HOME"] {
+        if let Some(value)=std::env::var_os(key) { command.env(key,value); }
+    }
     if let Some(path) = path {
         command.arg(path);
     }

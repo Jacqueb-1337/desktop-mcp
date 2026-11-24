@@ -95,17 +95,18 @@ fn main() {
             .and_then(|root|search::session(&root));
         std::process::exit(if result.is_ok(){0}else{1});
     }
-    if raw.first().is_some_and(|v|v=="--readonly-status-worker" || v=="--readonly-read-worker" || v=="--readonly-search-worker" || v=="--readonly-range-worker" || v=="--readonly-list-worker" || v=="--readonly-diff-worker") {
+    if raw.first().is_some_and(|v|v=="--readonly-status-worker" || v=="--readonly-read-worker" || v=="--readonly-search-worker" || v=="--readonly-range-worker" || v=="--readonly-list-worker" || v=="--readonly-diff-worker" || v=="--readonly-batch-worker") {
         let read=raw[0]=="--readonly-read-worker";
         let search=raw[0]=="--readonly-search-worker";
         let ranged=raw[0]=="--readonly-range-worker";
         let list=raw[0]=="--readonly-list-worker";
         let diff=raw[0]=="--readonly-diff-worker";
-        if raw.len()!=if read || search || ranged || list || diff {4}else{3} || raw[1]!="--workspace" {std::process::exit(2);}
+        let batch=raw[0]=="--readonly-batch-worker";
+        if raw.len()!=if read || search || ranged || list || diff || batch {4}else{3} || raw[1]!="--workspace" {std::process::exit(2);}
         let result=PathBuf::from(&raw[2]).canonicalize().map_err(|_|"WORKSPACE_UNAVAILABLE".to_string()).and_then(|root| {
-            if list || diff {
+            if list || diff || batch {
                 let query:Value=serde_json::from_str(raw[3].to_str().ok_or("INVALID_QUERY")?).map_err(|_|"INVALID_QUERY")?;
-                if list {readonly::list_worker(&root,&query)}else{readonly::diff_worker(&root,&query)}
+                if list {readonly::list_worker(&root,&query)}else if batch{readonly::batch_worker(&root,&query)}else{readonly::diff_worker(&root,&query)}
             } else if ranged {
                 let query:Value=serde_json::from_str(raw[3].to_str().ok_or("INVALID_READ_ARGUMENTS")?).map_err(|_|"INVALID_READ_ARGUMENTS")?;
                 readonly::ranged_read_worker(&root,&query)

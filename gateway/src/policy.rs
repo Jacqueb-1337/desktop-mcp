@@ -69,17 +69,21 @@ pub fn valid_prepare_args(args:&Value)->bool {
     && args["changes"].as_array().is_some_and(|items|!items.is_empty() && items.len()<=16
         && items.iter().all(|item|{
             item.as_object().is_some_and(|o| {
-                ["path","operation","expected_sha256","new_content"].iter().all(|k|o.contains_key(*k))
-                && (o.len()==4 || (o.len()==5 && o.contains_key("edits")
-                    && item["operation"]=="modify" && item["new_content"].is_null()
-                    && valid_text_edits(&item["edits"])))
+                let common=["path","operation","expected_sha256","new_content"].iter().all(|k|o.contains_key(*k));
+                let path=item["path"].as_str().is_some_and(valid_rel_patch_path);
+                let hash=|v:&Value|v.as_str().is_some_and(|s|s.len()==64 && s.bytes().all(|b|b.is_ascii_hexdigit()));
+                if !common||!path{return false;}
+                match item["operation"].as_str(){
+                    Some("copy"|"move"|"rename")=>o.len()==6 && item["expected_sha256"].is_null() &&
+                        item["new_content"].is_null() && item["source_path"].as_str().is_some_and(valid_rel_patch_path)
+                        && hash(&item["source_sha256"]),
+                    Some("create"|"modify"|"delete")=>(o.len()==4 || (o.len()==5 && o.contains_key("edits")
+                        && item["operation"]=="modify" && item["new_content"].is_null() && valid_text_edits(&item["edits"])))
+                        && (item["expected_sha256"].is_null()||hash(&item["expected_sha256"]))
+                        && (item["new_content"].is_null()||item["new_content"].as_str().is_some_and(|s|s.len()<=48000 && !s.contains('\0'))),
+                    _=>false
+                }
             })
-            && item["path"].as_str().is_some_and(valid_rel_patch_path)
-            && matches!(item["operation"].as_str(),Some("create"|"modify"|"delete"))
-            && (item["expected_sha256"].is_null()||item["expected_sha256"].as_str()
-                .is_some_and(|s|s.len()==64 && s.bytes().all(|b|b.is_ascii_hexdigit())))
-            && (item["new_content"].is_null()||item["new_content"].as_str()
-                .is_some_and(|s|s.len()<=48000 && !s.contains('\0')))
         }))
     && serde_json::to_vec(args).is_ok_and(|bytes|bytes.len()<=52000)
 }
@@ -104,6 +108,27 @@ pub fn valid_search_query(query:&Value)->bool {
         && o.get("offset").is_none_or(|v|v.as_u64().is_some_and(|n|n<=20000))
         && o.get("refresh").is_none_or(Value::is_boolean)
         && o.get("engine").is_none_or(|v|matches!(v.as_str(),Some("native"|"fff"))))
+}
+pub fn valid_batch_query(query:&Value)->bool{
+    query.as_array().is_some_and(|items|!items.is_empty()&&items.len()<=4&&items.iter().all(|item|{
+        item.as_object().is_some_and(|o|o.len()==2&&o.contains_key("tool")&&o.contains_key("arguments")) &&
+        match item["tool"].as_str(){
+            Some("fs_read")=>valid_batch_read_args(&item["arguments"]),
+            Some("fs_list")=>valid_list_query(&item["arguments"]),
+            Some("git_diff")=>valid_diff_query(&item["arguments"]),
+            Some("fs_search")=>valid_search_query(&item["arguments"]),
+            Some("git_status")=>item["arguments"]==json!({}),
+            _=>false
+        }
+    })) && serde_json::to_vec(query).is_ok_and(|v|v.len()<=12000)
+}
+fn valid_batch_read_args(args:&Value)->bool{
+    args.as_object().is_some_and(|o|
+        o.keys().all(|k|matches!(k.as_str(),"path"|"start_line"|"end_line"))
+        && args["path"].as_str().is_some_and(valid_rel_patch_path)
+        && o.get("start_line").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=8_388_608).contains(&n)))
+        && o.get("end_line").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=8_388_608).contains(&n)))
+        && args["end_line"].as_u64().is_none_or(|end|end>=args["start_line"].as_u64().unwrap_or(1)))
 }
 pub fn valid_list_query(query:&Value)->bool {
     query.as_object().is_some_and(|o|
@@ -141,13 +166,13 @@ impl PolicyFile {
             if host.host_id.len()!=32||!host.host_id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err("INVALID_POLICY_HOST_ID".into())
             }
-            if host.workspace_id!="default"||host.tools.len()>17 {
+            if host.workspace_id!="default"||host.tools.len()>18 {
                 return Err("INVALID_POLICY_WORKSPACE_OR_TOOLS".into())
             }
             if !unique.insert((host.host_id.as_str(),host.workspace_id.as_str())) {
                 return Err("DUPLICATE_POLICY_SCOPE".into())
             }
-            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"fs_search"|"fs_list"|"git_diff"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command")) {
+            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"fs_search"|"fs_list"|"fs_batch"|"git_diff"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command")) {
                 return Err("UNSAFE_POLICY_TOOL".into())
             }
             if host.tools.iter().collect::<HashSet<_>>().len()!=host.tools.len() {

@@ -235,7 +235,7 @@ impl MuxRoutes<'_> {
                 let staged=service::request(self.state,"approval_stage",json!({"route":frame}));
                 if !staged.as_ref().is_ok_and(|reply|reply["queued"]==true) {
                     let reason=match staged.as_ref().err().map(String::as_str) {
-                        Some(reason @ ("LOCAL_PERMISSION_REQUIRED"|"PERMISSION_REQUESTS_DISABLED"|"REMOTE_READONLY_DISABLED"|
+                        Some(reason @ ("LOCAL_PERMISSION_REQUIRED"|"BATCH_SUBTOOL_PERMISSION_REQUIRED"|"PERMISSION_REQUESTS_DISABLED"|"REMOTE_READONLY_DISABLED"|
                             "ADMIN_HELPER_UNAVAILABLE"|"SYSTEM_COMMAND_BUSY"|"SYSTEM_PERMISSION_BUSY"))=>reason,
                         _=>"LOCAL_APPROVAL_UNAVAILABLE",
                     };
@@ -274,6 +274,7 @@ fn scoped_route(tls:&mut (impl Read + Write),state:&Path,frame:&Value,host:&str)
     if !stage.as_ref().is_ok_and(|reply| reply["queued"] == true) {
         let reason = match stage.as_ref().err().map(String::as_str) {
             Some("LOCAL_PERMISSION_REQUIRED") => "LOCAL_PERMISSION_REQUIRED",
+            Some("BATCH_SUBTOOL_PERMISSION_REQUIRED") => "BATCH_SUBTOOL_PERMISSION_REQUIRED",
             Some("PERMISSION_REQUESTS_DISABLED") => "PERMISSION_REQUESTS_DISABLED",
             Some("REMOTE_READONLY_DISABLED") => "REMOTE_READONLY_DISABLED",
             Some("ADMIN_HELPER_UNAVAILABLE") => "ADMIN_HELPER_UNAVAILABLE",

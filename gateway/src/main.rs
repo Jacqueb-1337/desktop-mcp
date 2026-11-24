@@ -409,7 +409,7 @@ fn approval_poll_delay(elapsed:Duration)->Duration {
 
 fn run_scoped_route(tls:&mut StreamOwned<ServerConnection,TcpStream>,job:&broker::Job,allowlist:&Path,host:&str,broker:&broker::Broker)->Result<Value,String> {
     let staged=read_json(tls)?;
-    if let Some(reason @ ("LOCAL_PERMISSION_REQUIRED" | "PERMISSION_REQUESTS_DISABLED" | "REMOTE_READONLY_DISABLED" | "LOCAL_APPROVAL_UNAVAILABLE" | "ADMIN_HELPER_UNAVAILABLE")) = staged["error"].as_str() {
+    if let Some(reason @ ("LOCAL_PERMISSION_REQUIRED" | "BATCH_SUBTOOL_PERMISSION_REQUIRED" | "PERMISSION_REQUESTS_DISABLED" | "REMOTE_READONLY_DISABLED" | "LOCAL_APPROVAL_UNAVAILABLE" | "ADMIN_HELPER_UNAVAILABLE")) = staged["error"].as_str() {
         if staged == json!({"type":"route_rejected","version":2,"request_id":job.frame["request_id"],"request_hash":broker::digest(&job.frame),"error":reason}) {
             return Ok(json!({"request_id":job.frame["request_id"],"host_id":host,"workspace_id":"default",
                 "outcome":{"pending":false,"executed":false,"error":reason}}));
