@@ -537,6 +537,16 @@ fn respond(stream: &mut impl Write, status: u16, body: Option<Value>) -> Result<
 }
 pub fn start(
     address: SocketAddr,
+    tls: ServerConfig,
+    cfg: Config,
+    dispatch: Dispatch,
+) -> Result<(), String> {
+    let listener = TcpListener::bind(address).map_err(|e| format!("MCP_BIND: {e}"))?;
+    start_listener(listener, tls, cfg, dispatch)
+}
+
+fn start_listener(
+    listener: TcpListener,
     mut tls: ServerConfig,
     cfg: Config,
     dispatch: Dispatch,
@@ -544,7 +554,6 @@ pub fn start(
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls = Arc::new(tls);
     let cfg = Arc::new(cfg);
-    let listener = TcpListener::bind(address).map_err(|e| format!("MCP_BIND: {e}"))?;
     eprintln!(
         "MCP_LISTENING {}",
         listener.local_addr().map_err(|e| e.to_string())?
@@ -684,6 +693,102 @@ mod tests {
             assert_eq!(body.unwrap()["result"]["structuredContent"]["simulated"],true);
         }
         assert_eq!(arrivals,3,"RPC calls must enter dispatch before any finishes");
+    }
+
+    #[test]
+    fn independent_https_connections_overlap() {
+        use std::sync::{mpsc, Mutex, Condvar};
+        use std::net::TcpStream;
+        use rustls::{ClientConfig, ClientConnection, RootCertStore};
+        use rustls::pki_types::ServerName;
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let openssl = if cfg!(windows) {
+            "C:/Program Files/Git/usr/bin/openssl.exe"
+        } else { "openssl" };
+        let run = |args: &[&str]| {
+            let out = Command::new(openssl).args(args).current_dir(dir.path()).output().unwrap();
+            assert!(out.status.success(), "fixture certificate generation failed");
+        };
+        run(&["req","-x509","-newkey","rsa:2048","-nodes","-keyout","ca.key",
+            "-out","ca.pem","-days","1","-subj","/CN=Local Test CA",
+            "-addext","basicConstraints=critical,CA:TRUE",
+            "-addext","keyUsage=critical,keyCertSign,cRLSign"]);
+        run(&["req","-new","-newkey","rsa:2048","-nodes","-keyout","server.key",
+            "-out","server.csr","-subj","/CN=localhost"]);
+        std::fs::write(dir.path().join("ext"),"subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n").unwrap();
+        run(&["x509","-req","-in","server.csr","-CA","ca.pem","-CAkey","ca.key",
+            "-CAcreateserial","-out","server.pem","-days","1","-extfile","ext"]);
+        let read = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+        let cert = read("server.pem");
+        let key = read("server.key");
+        let tls = ServerConfig::builder().with_no_client_auth().with_single_cert(
+            rustls_pemfile::certs(&mut cert.as_slice()).collect::<Result<Vec<_>,_>>().unwrap(),
+            rustls_pemfile::private_key(&mut key.as_slice()).unwrap().unwrap()).unwrap();
+        let ca = read("ca.pem");
+        let mut roots = RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut ca.as_slice()) { roots.add(c.unwrap()).unwrap(); }
+        let client = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let authority = address.to_string();
+        let token = "ab".repeat(32);
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = release.clone();
+        let dispatch: Dispatch = Arc::new(move |_, _, _| {
+            arrived_tx.send(()).unwrap();
+            let lock = gate.0.lock().unwrap();
+            let _guard = gate.1.wait_timeout_while(lock, Duration::from_secs(8), |v| !*v).unwrap();
+            Ok(json!({"simulated":true}))
+        });
+        start_listener(listener, tls, Config { token: token.clone(), authority: authority.clone() }, dispatch).unwrap();
+        let workers: Vec<_> = (1..=3).map(|id| {
+            let (client, token, authority) = (client.clone(), token.clone(), authority.clone());
+            thread::spawn(move || {
+                let socket = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(12))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                let conn = ClientConnection::new(client, ServerName::try_from("localhost").unwrap()).unwrap();
+                let mut stream = StreamOwned::new(conn, socket);
+                let mut r = request();
+                r["id"] = json!(id);
+                r["method"] = json!("tools/call");
+                r["params"]["name"] = json!("git_status");
+                r["params"]["arguments"] = json!({"host_id":"ab".repeat(16),"workspace_id":"default"});
+                let body = r.to_string();
+                write!(stream, "POST /mcp HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: {VERSION}\r\nMcp-Method: tools/call\r\nMcp-Name: git_status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                stream.flush().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                use std::io::BufRead;
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("HTTP/1.1 200 "));
+                let mut len = None;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" { break; }
+                    if let Some(v) = line.strip_prefix("Content-Length: ") {
+                        len = Some(v.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut payload = vec![0;len.unwrap()];
+                reader.read_exact(&mut payload).unwrap();
+                let v: Value = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(v["id"], id);
+                assert_eq!(v["result"]["structuredContent"]["simulated"], true);
+            })
+        }).collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let mut arrivals = 0;
+        while arrivals < 3 && arrived_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_ok() {
+            arrivals += 1;
+        }
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        for worker in workers { worker.join().unwrap(); }
+        assert_eq!(arrivals, 3, "all three authenticated TLS requests must reach dispatch before any finishes");
     }
     #[test]
     fn modern_discovery_and_validation() {
