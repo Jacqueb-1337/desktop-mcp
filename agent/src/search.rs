@@ -92,7 +92,19 @@ impl SearchCache {
     pub fn query(&mut self,root:&Path,value:&Value)->Result<Value,String> {
         crate::readonly::validate_root(root)?;
         if !valid_query(value){return Err("INVALID_SEARCH_QUERY".into());}
-        let q:Query=serde_json::from_value(value.clone()).map_err(|_|"INVALID_SEARCH_QUERY")?;
+        let mut q:Query=serde_json::from_value(value.clone()).map_err(|_|"INVALID_SEARCH_QUERY")?;
+        let requested=q.engine.as_deref().unwrap_or("fff").to_owned();
+        q.engine=Some(requested.clone());
+        let unsupported=requested=="fff" && (q.regex ||
+            (q.mode=="paths" && q.case_sensitive) ||
+            (q.mode=="text" && (!q.pattern.is_ascii() || q.pattern.len()<2)));
+        if unsupported {q.engine=Some("native".into());}
+        let mut result=self.query_engine(root,&q)?;
+        if unsupported {result["fallback_reason"]=json!("query_requires_native");}
+        result["requested_engine"]=json!(requested);
+        Ok(result)
+    }
+    fn query_engine(&mut self,root:&Path,q:&Query)->Result<Value,String> {
         let pattern=if q.regex{q.pattern.clone()}else{regex::escape(&q.pattern)};
         let matcher=regex::RegexBuilder::new(&pattern).case_insensitive(!q.case_sensitive)
             .size_limit(1024*1024).build().map_err(|_|"INVALID_SEARCH_REGEX")?;
@@ -207,7 +219,9 @@ impl SearchCache {
             if Instant::now()>=deadline{exhausted=true;}
             if exhausted{break;}
         }
-        Ok(state.finish(&q,scanned,bytes,skipped,exhausted))
+        let mut result=state.finish(q,scanned,bytes,skipped,exhausted);
+        result["engine"]=json!("native");
+        Ok(result)
     }
 }
 fn walker(root:&Path,q:&Query)->ignore::WalkBuilder {
@@ -254,15 +268,21 @@ fn path_results(root:&Path,q:&Query,matcher:&regex::Regex,s:&Snapshot,cached:boo
     let mut scanned=0usize;
     let mut skipped=s.skipped;
     let mut exhausted=!complete;
-    let order:Vec<usize>=if q.engine.as_deref()==Some("fff") && !q.regex && !q.case_sensitive {
-        let mut matcher=neo_frizbee::Matcher::new(&q.pattern,&neo_frizbee::Config{
-            max_typos:Some((q.pattern.len()/4).clamp(1,3) as u16),..Default::default()
-        });
-        let mut ranked=matcher.match_list(&s.paths);
-        ranked.sort_by(|a,b|b.score.cmp(&a.score).then_with(||a.index.cmp(&b.index)));
-        ranked.into_iter().map(|m|m.index as usize).collect()
-    } else {(0..s.paths.len()).collect()};
-    let fuzzy=q.engine.as_deref()==Some("fff") && !q.regex && !q.case_sensitive;
+    let requested_fff=q.engine.as_deref()==Some("fff");
+    // Fall back to literal matching if the fuzzy matcher fails or returns no
+    // candidates. Do not change ordering halfway through an offset page.
+    let ranked=if requested_fff {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+            let mut fuzzy=neo_frizbee::Matcher::new(&q.pattern,&neo_frizbee::Config{
+                max_typos:Some((q.pattern.len()/4).clamp(1,3) as u16),..Default::default()
+            });
+            let mut ranked=fuzzy.match_list(&s.paths);
+            ranked.sort_by(|a,b|b.score.cmp(&a.score).then_with(||a.index.cmp(&b.index)));
+            ranked.into_iter().map(|m|m.index as usize).collect::<Vec<_>>()
+        })).ok().filter(|v|!v.is_empty())
+    }else{None};
+    let fuzzy=ranked.is_some();
+    let order=ranked.unwrap_or_else(||(0..s.paths.len()).collect());
     for index in order {
         let path=&s.paths[index];
         if Instant::now()>=deadline {exhausted=true;break;}
@@ -273,7 +293,8 @@ fn path_results(root:&Path,q:&Query,matcher:&regex::Regex,s:&Snapshot,cached:boo
         }
     }
     let mut result=state.finish(q,scanned,0,skipped,exhausted);
-    result["engine"]=json!(q.engine.as_deref().unwrap_or("native"));
+    result["engine"]=json!(if fuzzy{"fff"}else{"native"});
+    if requested_fff && !fuzzy {result["fallback_reason"]=json!("fuzzy_no_candidates_or_failure");}
     result["index_hit"]=json!(cached);
     result["index_entries"]=json!(s.paths.len());
     result["index_age_ms"]=json!(s.built.elapsed().as_millis());
@@ -338,7 +359,10 @@ fn fff_text(root:&Path,q:&Query,matcher:&regex::Regex,s:&mut Snapshot,pool:Optio
     let eligible=!q.regex && q.pattern.is_ascii() && q.pattern.len()>=2;
     let warm=s.content_index.is_some();
     if eligible && complete && s.content_index.is_none(){
-        s.content_index=build_fff_index(&dir,&s.paths,pool,deadline);
+        // Reserve time for a native scan if cold indexing is too expensive.
+        let index_deadline=deadline.min(Instant::now()+Duration::from_millis(1500));
+        s.content_index=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            build_fff_index(&dir,&s.paths,pool,index_deadline))).ok().flatten();
     }
     let candidates=if eligible {s.content_index.as_ref().and_then(|i|i.filter.query(q.pattern.as_bytes()))}else{None};
     let mut state=Page::new(q.offset);
@@ -393,7 +417,9 @@ fn fff_text(root:&Path,q:&Query,matcher:&regex::Regex,s:&mut Snapshot,pool:Optio
         }
     }
     let mut result=state.finish(q,scanned,bytes,skipped,exhausted);
-    result["engine"]=json!("fff");
+    let used_fff=candidates.is_some();
+    result["engine"]=json!(if used_fff{"fff"}else{"native"});
+    if !used_fff {result["fallback_reason"]=json!(if s.content_index.is_none(){"index_unavailable_or_slow"}else{"no_usable_prefilter"});}
     result["index_hit"]=json!(cached && warm);
     result["content_index_ready"]=json!(s.content_index.is_some());
     result["index_bytes_scanned"]=json!(if warm{0}else{s.content_index.as_ref().map(|i|i.bytes).unwrap_or(0)});
@@ -458,12 +484,17 @@ mod tests {
         std::fs::write(root.join(".gitignore"),"ignored.rs\n").unwrap();
         std::fs::write(root.join("ignored.rs"),"unique target needle\n").unwrap();
         let mut cache=SearchCache::new(&root,true);
-        let path=cache.query(&root,&json!({"mode":"paths","pattern":"authentcation","engine":"fff","limit":1})).unwrap();
+        let path=cache.query(&root,&json!({"mode":"paths","pattern":"authentcation","limit":1})).unwrap();
+        assert_eq!(path["engine"],"fff");
+        assert_eq!(path["requested_engine"],"fff");
         assert_eq!(path["results"][0]["path"],"authentication.rs");
         let text=cache.query(&root,&json!({"mode":"text","pattern":"unique target","engine":"fff"})).unwrap();
         assert_eq!(text["results"][0]["path"],"authentication.rs");
         assert_eq!(text["results"].as_array().unwrap().len(),1);
         assert_eq!(text["content_index_ready"],true);
+        let regex=cache.query(&root,&json!({"mode":"text","pattern":"unique.*needle","regex":true})).unwrap();
+        assert_eq!(regex["engine"],"native");
+        assert_eq!(regex["fallback_reason"],"query_requires_native");
         let unicode=cache.query(&root,&json!({"mode":"text","pattern":"kelvin","engine":"fff"})).unwrap();
         assert_eq!(unicode["results"][0]["path"],"unicode.rs");
         std::fs::write(root.join("other.rs"),"fresh newly matching text\n").unwrap();
@@ -480,7 +511,7 @@ mod tests {
         let root=tmp.path().canonicalize().unwrap();
         std::fs::write(root.join("first.rs"),"abc").unwrap();
         let mut cache=SearchCache::new(&root,true);
-        let q=json!({"mode":"paths","pattern":".rs"});
+        let q=json!({"mode":"paths","pattern":".rs","engine":"native"});
         let first=cache.query(&root,&q).unwrap();
         assert_eq!(first["index_hit"],false);
         if first["index_watch_active"]==true {
@@ -496,7 +527,7 @@ mod tests {
             assert_eq!(third["index_hit"],false);
             assert_eq!(third["results"].as_array().unwrap().len(),2);
         }
-        let refreshed=cache.query(&root,&json!({"mode":"paths","pattern":".rs","refresh":true})).unwrap();
+        let refreshed=cache.query(&root,&json!({"mode":"paths","pattern":".rs","refresh":true,"engine":"native"})).unwrap();
         assert_eq!(refreshed["index_hit"],false);
         let scoped=cache.query(&root,&json!({"mode":"paths","pattern":".rs","scope":"first.rs"})).unwrap();
         assert_eq!(scoped["results"],json!([{"path":"first.rs"}]));
@@ -535,7 +566,7 @@ mod tests {
         assert_eq!(result["results"][0]["path"],"main.rs");
         assert_eq!(result["results"][0]["line"],2);
         assert_eq!(result["truncated"],true);
-        let result=search(&root,&json!({"mode":"paths","pattern":".rs"})).unwrap();
+        let result=search(&root,&json!({"mode":"paths","pattern":".rs","engine":"native"})).unwrap();
         assert_eq!(result["results"],json!([{"path":"main.rs"}]));
         assert!(search(&root,&json!({"mode":"text","pattern":"[","regex":true})).is_err());
         assert!(!valid_query(&json!({"mode":"text","pattern":"x","limit":201})));

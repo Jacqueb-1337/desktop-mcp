@@ -104,7 +104,7 @@ fn implemented(name: &str) -> Value {
                 "exclude":{"type":"array","maxItems":32,"items":{"type":"string"},"description":"Repository-relative path prefixes to exclude"},
                 "context":{"type":"integer","minimum":0,"maximum":3},"offset":{"type":"integer","minimum":0,"maximum":20000},
                 "refresh":{"type":"boolean","description":"Force a fresh search index"},
-                "engine":{"enum":["native","fff"],"description":"Native exact/regex or FFF fuzzy paths and indexed text"}},
+                "engine":{"enum":["native","fff"],"default":"fff","description":"FFF fuzzy paths and indexed text by default; native exact/regex fallback or explicit override"}},
                 "required":["mode","pattern"]});
             tool(name,"Search Git-ignore-aware repository paths or UTF-8 text, literal or regex; bounded results.",
                 schema(p,&["host_id","workspace_id","query"]),true)

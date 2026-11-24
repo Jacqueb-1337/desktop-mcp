@@ -183,7 +183,7 @@ def main(agent,gateway,permissions=False):
             else: (repo/"escape").symlink_to(outside,target_is_directory=True)
             future=pool.submit(call,tool="fs_read",path="escape/secret.txt");item=wait_pending(state);approve(state,item)
             result=future.result(20);assert result["isError"] is True and "not shared" not in json.dumps(result),result
-            future=pool.submit(call,tool="fs_search",query={"mode":"paths","pattern":"secret"});item=wait_pending(state);approve(state,item)
+            future=pool.submit(call,tool="fs_search",query={"mode":"paths","pattern":"secret","engine":"native"});item=wait_pending(state);approve(state,item)
             result=future.result(20)
             assert not result["isError"] and result["structuredContent"]["outcome"]["data"]["results"]==[],result
             # Use the production standalone repository mode in an isolated fixture.
@@ -236,7 +236,7 @@ def main(agent,gateway,permissions=False):
             committed=approved("git_commit_patch",patch_id=patch_id,message="Targeted edit smoke")
             assert committed["status"]=="committed"
             assert (repo/"example.txt").read_text()=="changed\n"
-            paths={"mode":"paths","pattern":"large.txt"}
+            paths={"mode":"paths","pattern":"large.txt","engine":"native"}
             cold=approved("fs_search",query={**paths,"refresh":True})
             assert cold["results"]==[{"path":"large.txt"}] and cold["index_hit"] is False,cold
             warm=approved("fs_search",query=paths)
@@ -245,14 +245,17 @@ def main(agent,gateway,permissions=False):
                 assert warm["index_hit"],warm
             (repo/"brand_new.txt").write_text("needle")
             time.sleep(.3)
-            fresh=approved("fs_search",query={"mode":"paths","pattern":"brand_new.txt"})
+            fresh=approved("fs_search",query={"mode":"paths","pattern":"brand_new.txt","engine":"native"})
             assert fresh["results"]==[{"path":"brand_new.txt"}],fresh
             assert fresh["index_hit"] is False,fresh
-            fuzzy=approved("fs_search",query={"mode":"paths","engine":"fff","pattern":"lare.txt","limit":1})
+            fuzzy=approved("fs_search",query={"mode":"paths","pattern":"lare.txt","limit":1})
             assert fuzzy["engine"]=="fff" and fuzzy["results"][0]["path"]=="large.txt",fuzzy
-            indexed=approved("fs_search",query={"mode":"text","engine":"fff","pattern":"patched needle"})
+            indexed=approved("fs_search",query={"mode":"text","pattern":"patched needle"})
             assert indexed["engine"]=="fff" and indexed["results"][0]["path"]=="large.txt",indexed
             assert "escape" not in str(indexed["results"])
+            fallback=approved("fs_search",query={"mode":"text","pattern":"patched.*needle","regex":True})
+            assert fallback["requested_engine"]=="fff" and fallback["engine"]=="native" and fallback["fallback_reason"]=="query_requires_native",fallback
+            assert fallback["results"][0]["path"]=="large.txt",fallback
             print("PASS: FFF fuzzy paths and indexed text through the existing approval boundary")
             print("PASS: resident search worker, index reuse and invalidation through HTTPS/TLS")
             print("PASS: standalone remote ranged read and targeted patch preview/apply/commit")

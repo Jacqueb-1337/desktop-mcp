@@ -94,6 +94,7 @@ pub fn connect(target: &GatewayTarget<'_>, probe: bool) -> Result<Value, String>
         let attempt=(|| {
             let socket=TcpStream::connect_timeout(&address,Duration::from_secs(4))
                 .map_err(|e|format!("GATEWAY_CONNECT_FAILED: {e}"))?;
+            socket.set_nodelay(true).map_err(|e|e.to_string())?;
             socket.set_read_timeout(Some(Duration::from_secs(12))).map_err(|e|e.to_string())?;
             socket.set_write_timeout(Some(Duration::from_secs(12))).map_err(|e|e.to_string())?;
             let connection=ClientConnection::new(config.clone(),hostname.clone()).map_err(|e|e.to_string())?;
@@ -158,6 +159,7 @@ if route_enabled {
     loop {
         let mut heartbeat=json!({"type":"heartbeat","version":1});
         if mux_capable { heartbeat["route_mux_v1"]=json!(true); }
+        let heartbeat_started=std::time::Instant::now();
         send_json(&mut tls,&heartbeat)?;
         let ack=recv_json(&mut tls)?;
         if ack.get("type").and_then(Value::as_str)!=Some("heartbeat_ack")
@@ -194,7 +196,12 @@ if route_enabled {
         if ack.get("route").is_none() && pending.active.is_empty() {
             // Executable gateways already long-poll their request queue.
             // Retain a bounded idle backoff for old/identity-only peers.
-            thread::sleep(if exec_enabled {Duration::from_millis(200)} else {Duration::from_secs(4)});
+            if exec_enabled {
+                // Older gateways may answer immediately; bound idle CPU/network churn.
+                if let Some(delay)=Duration::from_millis(200).checked_sub(heartbeat_started.elapsed()) {
+                    thread::sleep(delay);
+                }
+            } else {thread::sleep(Duration::from_secs(4));}
         }
     }
 }

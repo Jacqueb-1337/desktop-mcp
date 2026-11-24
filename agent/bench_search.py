@@ -25,7 +25,7 @@ def main():
                 if (i, j) == (args.dirs-1, args.files-1):
                     text += "needle_unique\n"
                 (folder / f"source{j:04}.txt").write_text(text)
-        query = {"mode":"paths","pattern":f"source{args.files-1:04}.txt","limit":min(args.dirs,200)}
+        query = {"engine":"native","mode":"paths","pattern":f"source{args.files-1:04}.txt","limit":min(args.dirs,200)}
         started = time.perf_counter()
         result = subprocess.run([exe,"--readonly-search-worker","--workspace",directory,json.dumps(query)],
                                 capture_output=True,text=True,check=True)
@@ -55,11 +55,11 @@ def main():
                 print("worker_rss_mib unavailable (optional psutil not installed)")
             (root/"newfile.txt").write_text("new")
             time.sleep(.25)
-            elapsed, result = ask({"mode":"paths","pattern":"newfile.txt"})
+            elapsed, result = ask({"mode":"paths","pattern":"newfile.txt","engine":"native"})
             assert result["results"] == [{"path":"newfile.txt"}], result
             print("invalidation_ms",round(elapsed,2))
             for scope in (None,f"dir{args.dirs-1:04}"):
-                q = {"mode":"text","pattern":"needle_unique"}
+                q = {"mode":"text","pattern":"needle_unique","engine":"native"}
                 if scope: q["scope"] = scope
                 elapsed,result = ask(q)
                 print("text_ms",round(elapsed,2),"scope",scope,"matches",len(result["results"]),

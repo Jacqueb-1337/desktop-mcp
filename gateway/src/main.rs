@@ -201,6 +201,7 @@ impl Drop for Registration {
 }
 
 fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf, sessions: Sessions, route_job: Option<RouteJob>, broker:Option<Arc<broker::Broker>>, expected_host:Option<&str>) -> Result<(), String> {
+    stream.set_nodelay(true).map_err(|e|e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e|e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e|e.to_string())?;
     let connection = ServerConnection::new(config).map_err(|e|e.to_string())?;
@@ -401,6 +402,11 @@ fn mux_heartbeat(tls:&mut (impl Read+Write),
     Ok(())
 }
 
+fn approval_poll_delay(elapsed:Duration)->Duration {
+    Duration::from_millis(if elapsed<Duration::from_millis(500){25}
+        else if elapsed<Duration::from_secs(2){100}else{250})
+}
+
 fn run_scoped_route(tls:&mut StreamOwned<ServerConnection,TcpStream>,job:&broker::Job,allowlist:&Path,host:&str,broker:&broker::Broker)->Result<Value,String> {
     let staged=read_json(tls)?;
     if let Some(reason @ ("LOCAL_PERMISSION_REQUIRED" | "PERMISSION_REQUESTS_DISABLED" | "REMOTE_READONLY_DISABLED" | "LOCAL_APPROVAL_UNAVAILABLE" | "ADMIN_HELPER_UNAVAILABLE")) = staged["error"].as_str() {
@@ -411,12 +417,15 @@ fn run_scoped_route(tls:&mut StreamOwned<ServerConnection,TcpStream>,job:&broker
     }
     if staged!=json!({"type":"route_staged","version":2,"request_id":job.frame["request_id"],"request_hash":broker::digest(&job.frame)}) {return Err("ROUTE_STAGE_FAILED".into());}
     let expires=job.frame["expires_at"].as_u64().ok_or("INVALID_EXPIRY")?;
+    let started=Instant::now();
     loop {
         let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_|"CLOCK_INVALID")?.as_secs();
         if job.canceled.load(std::sync::atomic::Ordering::SeqCst) || now>=expires || !host_allowed(allowlist,host,Some(broker))? {return Err("ROUTE_CANCELED_EXPIRED_OR_REVOKED".into());}
         send_json(tls,&json!({"type":"route_poll","version":2,"request_hash":broker::digest(&job.frame)}))?;
         let response=read_json(tls)?;
-        if response==json!({"type":"route_pending","version":2,"request_hash":broker::digest(&job.frame)}) {thread::sleep(Duration::from_millis(250));continue;}
+        if response==json!({"type":"route_pending","version":2,"request_hash":broker::digest(&job.frame)}) {
+            thread::sleep(approval_poll_delay(started.elapsed()));continue;
+        }
         broker::verify_result(&response,&job.frame)?;
         return Ok(json!({"request_id":job.frame["request_id"],"host_id":host,"workspace_id":"default","outcome":response["outcome"]}));
     }
@@ -686,6 +695,12 @@ mod tests {
         assert!(verify_claim(&claim,&nonce,&HashMap::new()).is_err());
     }
 
+    #[test]
+    fn approval_poll_backs_off_after_fast_window(){
+        assert_eq!(approval_poll_delay(Duration::ZERO),Duration::from_millis(25));
+        assert_eq!(approval_poll_delay(Duration::from_millis(500)),Duration::from_millis(100));
+        assert_eq!(approval_poll_delay(Duration::from_secs(2)),Duration::from_millis(250));
+    }
     #[test]
     fn multiplex_scheduler_starts_four_jobs_before_poll_and_rejects_canceled_work(){
         use std::sync::{mpsc,atomic::{AtomicBool,Ordering}};

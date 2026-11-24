@@ -194,7 +194,7 @@ fn search_schema()->Value {
                 "exclude":{"type":"array","maxItems":32,"items":{"type":"string"},"description":"Repository-relative path prefixes to exclude"},
                 "context":{"type":"integer","minimum":0,"maximum":3},"offset":{"type":"integer","minimum":0,"maximum":20000},
                 "refresh":{"type":"boolean","description":"Force a fresh search index"},
-                "engine":{"enum":["native","fff"],"description":"Native exact/regex or FFF fuzzy paths and indexed text"}},
+                "engine":{"enum":["native","fff"],"default":"fff","description":"FFF fuzzy paths and indexed text by default; native exact/regex fallback or explicit override"}},
         "required":["mode","pattern"]});
     v["required"].as_array_mut().unwrap().push(json!("query"));
     v
@@ -606,6 +606,7 @@ fn start_listener(
                     }
                 }
                 let _guard = Guard(count);
+                let _ = socket.set_nodelay(true);
                 let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
                 let _ = socket.set_write_timeout(Some(Duration::from_secs(10)));
                 if let Ok(conn) = ServerConnection::new(tls) {

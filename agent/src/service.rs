@@ -566,6 +566,7 @@ fn handle_connection(
     dir:&Path,
     token: &str,
 ) -> Result<(), String> {
+    stream.set_nodelay(true).map_err(|e|e.to_string())?;
     stream.set_read_timeout(Some(SOCKET_TIMEOUT)).map_err(|e|e.to_string())?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT)).map_err(|e|e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e|e.to_string())?);
@@ -652,6 +653,7 @@ pub fn request(dir: &Path, method:&str, extra: Value) -> Result<Value, String> {
     let dest=SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST),runtime.port);
     let mut stream=TcpStream::connect_timeout(&dest,Duration::from_secs(2))
         .map_err(|e|format!("LOCAL_AGENT_OFFLINE: {e}"))?;
+    stream.set_nodelay(true).map_err(|e|e.to_string())?;
     stream.set_read_timeout(Some(SOCKET_TIMEOUT)).map_err(|e|e.to_string())?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT)).map_err(|e|e.to_string())?;
     let mut query=json!({"token":runtime.token,"method":method});
