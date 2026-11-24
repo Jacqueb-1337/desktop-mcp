@@ -32,3 +32,17 @@ into a disposable directory, compare the packaged executable to the build
 artifact, verify the checksum and run the extracted executable's version and
 offline validation commands. Test service integration separately in a
 disposable environment before deploying a production update.
+
+## Isolated package lifecycle regression
+
+The fixture-only lifecycle test uses a temporary root and its own dpkg database.
+It installs two harmless static executables in succession, checks same-version
+reinstall and downgrade, and removes and purges the package. It verifies file
+contents, ownership and mode of dummy external settings, pairings, certificate,
+legacy executable and service unit at every step. No service is started or
+changed. This tests the package-managed binary lifecycle, not legacy service
+migration, automatic rollback on service failure, or live connectivity.
+
+Run only in a disposable Linux test environment with dpkg and a static C toolchain:
+
+    sudo bash docs/test-gateway-package-lifecycle.sh
