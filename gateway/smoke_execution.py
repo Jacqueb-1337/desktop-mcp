@@ -40,7 +40,7 @@ def main(agent,gateway,permissions=False):
             _, _, other_identity = setup_agent(agent, other_root)
             identities.append(other_identity)
         allowed=root/"allowlist.json";allowed.write_text(json.dumps({"version":1,"hosts":[{"host_id":item["host_id"],"public_key":item["public_key"]} for item in identities]}))
-        tools = ["git_status", "fs_read", "fs_search", "patch_prepare", "patch_review", "patch_apply", "git_commit_patch"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
+        tools = ["git_status", "fs_read", "fs_search", "fs_list", "git_diff", "patch_prepare", "patch_review", "patch_apply", "git_commit_patch"] + (["request_permission", "system_volume_status", "admin_command"] if permissions else [])
         policy=root/"policy.json";policy.write_text(json.dumps({"version":1,"hosts":[{"host_id":identity["host_id"],"workspace_id":"default","tools":tools}]}))
         audit=root/"audit";audit.mkdir(mode=0o700)
         token=secrets.token_hex(32);token_path=root/"token";token_path.write_text(token);token_path.chmod(0o600)
@@ -49,9 +49,12 @@ def main(agent,gateway,permissions=False):
         pool=concurrent.futures.ThreadPoolExecutor(2)
         try:
             service,_=restart_local_service(subprocess.Popen([sys.executable,"-c","pass"]),agent,repo,state,True,require_pairing_consent=permissions);processes.append(service)
-            def start_gateway(peer=None, expected_host=None):
+            def start_gateway(peer=None, expected_host=None, capture_stderr=False):
                 private_listener = ["--allow-lan", "--private-listen", "127.0.0.1:0", "--private-peer", peer, "--private-host", expected_host] if peer else []
-                process=subprocess.Popen([str(gateway),"--cert",str(cert),"--key",str(key),"--allowlist",str(allowed),"--policy",str(policy),"--audit-dir",str(audit),"--mcp-listen",f"127.0.0.1:{port}","--mcp-authority",f"localhost:{port}","--mcp-token-file",str(token_path),*private_listener],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                # The running gateway logs every route to stderr. An undrained
+                # Windows pipe can fill and block its dispatcher during long tests.
+                with (root/"gateway-stderr.log").open("ab") as log:
+                    process=subprocess.Popen([str(gateway),"--cert",str(cert),"--key",str(key),"--allowlist",str(allowed),"--policy",str(policy),"--audit-dir",str(audit),"--mcp-listen",f"127.0.0.1:{port}","--mcp-authority",f"localhost:{port}","--mcp-token-file",str(token_path),*private_listener],stdout=subprocess.PIPE,stderr=subprocess.PIPE if capture_stderr else log,text=True)
                 processes.append(process)
                 line=process.stdout.readline();assert line.startswith("LISTENING "),line
                 address=line.split()[1]
@@ -71,7 +74,7 @@ def main(agent,gateway,permissions=False):
                 rejected.terminate()
                 rejected.communicate(timeout=5)
 
-                rejected, address = start_gateway("127.0.0.1", other_identity["host_id"])
+                rejected, address = start_gateway("127.0.0.1", other_identity["host_id"],capture_stderr=True)
                 attempt = client_attempt(agent, state, address, "localhost", ca)
                 assert attempt.returncode != 0, "Private listener accepted a different allowlisted host"
                 rejected.terminate()
@@ -85,8 +88,8 @@ def main(agent,gateway,permissions=False):
             assert gw.stdout.readline().startswith("CONTROL_PROBE_OK ")
             def call(request_id=None,host=None,tool="git_status",path=None,**extra):
                 payload=request("tools/call",name=tool,arguments={"host_id":host or identity["host_id"],"workspace_id":"default",**({"request_id":request_id} if request_id else {}),**({"path":path} if path is not None else {}),**extra})
-                connection=http.client.HTTPSConnection("localhost",port,context=ssl.create_default_context(cafile=str(ca)),timeout=115)
-                connection.request("POST","/mcp",json.dumps(payload),{"Authorization":"Bearer "+token,"Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":VERSION,"Mcp-Method":"tools/call","Mcp-Name":tool})
+                connection=http.client.HTTPSConnection("127.0.0.1",port,context=ssl.create_default_context(cafile=str(ca)),timeout=115)
+                connection.request("POST","/mcp",json.dumps(payload),{"Host":f"localhost:{port}","Authorization":"Bearer "+token,"Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":VERSION,"Mcp-Method":"tools/call","Mcp-Name":tool})
                 response=connection.getresponse();body=json.loads(response.read());connection.close();assert response.status==200,body;return body["result"]
             assert call(host="ff"*16)["isError"] is True
             (repo/"example.txt").write_text("changed\n")
@@ -169,9 +172,9 @@ def main(agent,gateway,permissions=False):
             approve(state,item,"deny")
             assert future.result(20)["isError"] is True
             # Closing the requesting client must stop pending execution.
-            connection=http.client.HTTPSConnection("localhost",port,context=ssl.create_default_context(cafile=str(ca)),timeout=10)
+            connection=http.client.HTTPSConnection("127.0.0.1",port,context=ssl.create_default_context(cafile=str(ca)),timeout=10)
             canceled_id=str(uuid.uuid4())
-            connection.request("POST","/mcp",json.dumps(request("tools/call",name="git_status",arguments={"host_id":identity["host_id"],"workspace_id":"default","request_id":canceled_id})),{"Authorization":"Bearer "+token,"Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":VERSION,"Mcp-Method":"tools/call","Mcp-Name":"git_status"})
+            connection.request("POST","/mcp",json.dumps(request("tools/call",name="git_status",arguments={"host_id":identity["host_id"],"workspace_id":"default","request_id":canceled_id})),{"Host":f"localhost:{port}","Authorization":"Bearer "+token,"Content-Type":"application/json","Accept":"application/json, text/event-stream","MCP-Protocol-Version":VERSION,"Mcp-Method":"tools/call","Mcp-Name":"git_status"})
             item=wait_pending(state);connection.close();time.sleep(1);approve(state,item);time.sleep(.5)
             events=[json.loads(line) for line in (state/"remote-approval-journal-v1.jsonl").read_text().splitlines()]
             assert not any(e.get("choice")=="consume" and e.get("request_id")==canceled_id for e in events),"Canceled operation executed"
@@ -210,6 +213,44 @@ def main(agent,gateway,permissions=False):
                 assert not result["isError"],result
                 return result["structuredContent"]["outcome"]["data"]
             subprocess.run(["git","-C",str(repo),"config","core.autocrlf","false"],check=True)
+            (repo/"nested").mkdir()
+            (repo/"nested"/"sample.txt").write_text("nested sample\n")
+            listing=approved("fs_list",query={"path":".","depth":2,"limit":200})
+            entries={e["path"]:e for e in listing["entries"]}
+            assert entries["nested"]["kind"]=="directory",listing
+            assert entries["nested/sample.txt"]["kind"]=="file",listing
+            assert entries["ignored.txt"]["kind"]=="file",listing
+            assert not any(p.startswith("escape") or p.startswith(".git/") or p==".git" for p in entries),listing
+            first_list=approved("fs_list",query={"path":".","depth":2,"limit":2})
+            second_list=approved("fs_list",query={"path":".","depth":2,"limit":200,"offset":first_list["next_offset"]})
+            assert first_list["entries"]+second_list["entries"]==listing["entries"]
+            for tool,query in [("fs_list",{"path":"escape"}),("git_diff",{"path":"escape/secret.txt"})]:
+                future=pool.submit(call,tool=tool,query=query)
+                item=wait_pending(state);assert item["arguments"]=={"query":query}
+                approve(state,item);result=future.result(20)
+                assert result["isError"] and "not shared" not in json.dumps(result),result
+            future=pool.submit(call,tool="fs_list",query={"depth":1})
+            item=wait_pending(state);approve(state,item,"deny")
+            assert future.result(20)["isError"]
+            (repo/"diff.txt").write_bytes(b"original\n")
+            subprocess.run(["git","-C",str(repo),"add","diff.txt"],check=True)
+            subprocess.run(["git","-C",str(repo),"commit","-qm","diff fixture"],check=True)
+            (repo/"diff.txt").write_bytes(b"staged\n")
+            subprocess.run(["git","-C",str(repo),"add","diff.txt"],check=True)
+            (repo/"diff.txt").write_bytes(b"unstaged\n")
+            for base,old,new in [("head","original","unstaged"),("staged","original","staged"),("unstaged","staged","unstaged")]:
+                diff=approved("git_diff",query={"path":"diff.txt","base":base})
+                assert diff["changed"] and not diff["truncated"] and "-"+old in diff["diff"] and "+"+new in diff["diff"],diff
+            assert (repo/"diff.txt").read_bytes()==b"unstaged\n"
+            (repo/"diff.txt").unlink()
+            deleted=approved("git_diff",query={"path":"diff.txt"})
+            assert deleted["old_exists"] and not deleted["new_exists"] and "-original" in deleted["diff"],deleted
+            (repo/"binary.dat").write_bytes(b"\x00\xff")
+            binary=approved("git_diff",query={"path":"binary.dat"})
+            assert binary["changed"] and binary["binary"] and not binary["diff"],binary
+            # Restore staged fixture and working tree before patch smoke.
+            subprocess.run(["git","-C",str(repo),"restore","--source=HEAD","--staged","--worktree","diff.txt"],check=True)
+            print("PASS: directory pagination, link exclusion, exact approval, three diff modes, deletion and binary summary")
             original=b"padding line\n"*1800+b"unique needle\n"
             (repo/"large.txt").write_bytes(original)
             subprocess.run(["git","-C",str(repo),"add","large.txt"],check=True)

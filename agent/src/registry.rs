@@ -55,7 +55,7 @@ const RESERVED: &[&str] = &[
 ];
 
 const IMPLEMENTED: &[&str] = &[
-    "gateway_info", "list_hosts", "get_capabilities", "fs_read", "fs_search",
+    "gateway_info", "list_hosts", "get_capabilities", "fs_read", "fs_search", "fs_list",
     "git_status", "git_diff", "patch_prepare", "patch_review",
     "patch_apply", "patch_status", "git_commit_patch"
 ];
@@ -95,6 +95,12 @@ fn implemented(name: &str) -> Value {
             p["end_line"]=json!({"type":"integer","minimum":1,"maximum":8388608});
             tool(name,"Read a bounded UTF-8 line page with full-file SHA-256 and Git HEAD.",
                  schema(p,&["host_id","workspace_id","path"]),true)
+        },
+        "fs_list" => {
+            p["query"]=json!({"type":"object","additionalProperties":false,"properties":{
+                "path":{"type":"string","default":"."},"depth":{"type":"integer","minimum":1,"maximum":5},
+                "limit":{"type":"integer","minimum":1,"maximum":200},"offset":{"type":"integer","minimum":0,"maximum":20000}}});
+            tool(name,"List directory entries with bounded recursion and pagination.",schema(p,&["host_id","workspace_id","query"]),true)
         },
         "fs_search" => {
             p["query"]=json!({"type":"object","additionalProperties":false,"properties":{

@@ -21,7 +21,7 @@ By default the server is read-only. To explicitly enable file changes for a trus
 ## Working tools
 
 - `gateway_info`, `list_hosts`, `get_capabilities`
-- `fs_read`, `fs_search`, `git_status`, `git_diff`
+- `fs_read`, `fs_search`, `fs_list`, `git_status`, `git_diff`
 - `patch_prepare`, `patch_review`, `patch_status`, `patch_apply`, `git_commit_patch`
 
 Other advertised tools are deliberately marked as **NOT_IMPLEMENTED** and return errors without side effects. Their generic argument wrapper allows implementing new functionality without changing tool names/schemas.
@@ -79,3 +79,5 @@ The smoke test creates a disposable Git repository, performs MCP JSON-RPC reques
 - `docs/build-agent-windows-on-nas.sh`: Windows x64 cross-build using cargo-xwin.
 
 Both use the NAS ext4 HDD for source/cache and refuse to run if the HDD mount is unavailable.
+
+Remote repository browsing: `fs_list` accepts `query` with path (default "."), depth 1?5, limit 1?200 and offset. Entries include ignored files, omit Git metadata and links; incomplete scan budgets are explicit. Remote `git_diff` accepts a single relative file in `query.path`, base head/staged/unstaged and context 0?10. It compares raw file bytes, not Git filters or rename/mode detection; text is limited to 256 KiB per side, output bounded, binary content omitted. Both require separately allowed capabilities and exact local approval. Local stdio git_diff retains its legacy schema.

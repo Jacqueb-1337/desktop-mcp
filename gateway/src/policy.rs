@@ -105,6 +105,21 @@ pub fn valid_search_query(query:&Value)->bool {
         && o.get("refresh").is_none_or(Value::is_boolean)
         && o.get("engine").is_none_or(|v|matches!(v.as_str(),Some("native"|"fff"))))
 }
+pub fn valid_list_query(query:&Value)->bool {
+    query.as_object().is_some_and(|o|
+        o.keys().all(|k|matches!(k.as_str(),"path"|"depth"|"limit"|"offset"))
+        && o.get("path").is_none_or(|v|v.as_str().is_some_and(|s|s=="."||valid_rel_patch_path(s)))
+        && o.get("depth").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=5).contains(&n)))
+        && o.get("limit").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=200).contains(&n)))
+        && o.get("offset").is_none_or(|v|v.as_u64().is_some_and(|n|n<=20000)))
+}
+pub fn valid_diff_query(query:&Value)->bool {
+    query.as_object().is_some_and(|o|
+        o.keys().all(|k|matches!(k.as_str(),"path"|"base"|"context"))
+        && query["path"].as_str().is_some_and(valid_rel_patch_path)
+        && o.get("base").is_none_or(|v|matches!(v.as_str(),Some("head"|"staged"|"unstaged")))
+        && o.get("context").is_none_or(|v|v.as_u64().is_some_and(|n|n<=10)))
+}
 pub fn valid_duration(duration: &str) -> bool {
     matches!(duration, "permanent" | "1h" | "4h") || duration.strip_suffix('m').is_some_and(|minutes| {
         minutes.parse::<u64>().is_ok_and(|n| (1..=1440).contains(&n) && n.to_string() == minutes)
@@ -126,13 +141,13 @@ impl PolicyFile {
             if host.host_id.len()!=32||!host.host_id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err("INVALID_POLICY_HOST_ID".into())
             }
-            if host.workspace_id!="default"||host.tools.len()>15 {
+            if host.workspace_id!="default"||host.tools.len()>17 {
                 return Err("INVALID_POLICY_WORKSPACE_OR_TOOLS".into())
             }
             if !unique.insert((host.host_id.as_str(),host.workspace_id.as_str())) {
                 return Err("DUPLICATE_POLICY_SCOPE".into())
             }
-            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"fs_search"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command")) {
+            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"fs_search"|"fs_list"|"git_diff"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command")) {
                 return Err("UNSAFE_POLICY_TOOL".into())
             }
             if host.tools.iter().collect::<HashSet<_>>().len()!=host.tools.len() {

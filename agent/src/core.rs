@@ -361,7 +361,7 @@ impl Agent {
             "list_hosts" => Ok(json!({"hosts":[{"host_id":"local","name":"Local computer","connected":true,"workspace_ids":["default"]}]})),
             "get_capabilities" => Ok(json!({
                 "host_id":"local", "workspace_id":"default",
-                "implemented":["gateway_info","list_hosts","get_capabilities","fs_read","fs_search","git_status","git_diff",
+                "implemented":["gateway_info","list_hosts","get_capabilities","fs_read","fs_search","fs_list","git_status","git_diff",
                     "patch_prepare","patch_review","patch_apply","patch_status","git_commit_patch"],
                 "writes_enabled":self.allow_writes,
                 "remote_pairing":false,"admin":false,"shell":false
@@ -375,6 +375,7 @@ impl Agent {
                         crate::readonly::ranged_read_worker(&self.workspace,&query)
                     },
                     "fs_search" => crate::search::search(&self.workspace,&args["query"]),
+                    "fs_list" => crate::readonly::list_worker(&self.workspace,&args["query"]),
                     "git_status" => self.git_status(),
                     "git_diff" => self.git_diff(args),
                     "git_snapshot" => self.git_snapshot(args),

@@ -222,14 +222,14 @@ impl Broker {
             workspace_id: "default".into(),
             tool: tool.into(),
         };
-        if !matches!(tool, "git_status" | "fs_read" | "fs_search" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result" | "elevated_user_command" | "elevated_user_command_result") && !terminal_tool(tool)
+        if !matches!(tool, "git_status" | "fs_read" | "fs_search" | "fs_list" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result" | "elevated_user_command" | "elevated_user_command_result") && !terminal_tool(tool)
             || self.policy_decision(&intent, host) != Decision::RequiresLocalApproval
         {
             return Err("POLICY_DENIED".into());
         }
         if tool == "request_permission" {
             let capability = args["capability"].as_str().ok_or("CAPABILITY_REQUIRED")?;
-            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "fs_search" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command" | "elevated_user_command")
+            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "fs_search" | "fs_list" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command" | "elevated_user_command")
                 || !args["duration"].as_str().is_some_and(crate::policy::valid_duration)
             {
                 return Err("INVALID_PERMISSION_REQUEST".into());
@@ -265,7 +265,7 @@ impl Broker {
                 for key in ["start_line","end_line"] {if let Some(value)=args.get(key){payload[key]=value.clone();}}
                 payload
             },
-            "fs_search" => json!({"query":args["query"]}),
+            "fs_search"|"fs_list"|"git_diff" => json!({"query":args["query"]}),
             "use_repository" => json!({"path":args["path"],"initialize":args["initialize"]}),
             "git_snapshot" => json!({"paths":args["paths"],"message":args["message"]}),
             "patch_prepare" => json!({"expected_head":args["expected_head"],"changes":args["changes"]}),

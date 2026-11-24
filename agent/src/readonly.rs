@@ -234,6 +234,166 @@ pub fn ranged_read_worker(root:&Path,args:&Value)->Result<Value,String> {
         "total_lines":total,"next_start_line":if last<total {Some(last+1)}else{None},
         "truncated":last<end.min(total)}))
 }
+pub fn valid_list_query(query:&Value)->bool {
+    query.as_object().is_some_and(|o|
+        o.keys().all(|k|matches!(k.as_str(),"path"|"depth"|"limit"|"offset"))
+        && o.get("path").is_none_or(|v|v.as_str().is_some_and(|s|s=="."||valid_read_path(s)))
+        && o.get("depth").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=5).contains(&n)))
+        && o.get("limit").is_none_or(|v|v.as_u64().is_some_and(|n|(1..=200).contains(&n)))
+        && o.get("offset").is_none_or(|v|v.as_u64().is_some_and(|n|n<=20000)))
+}
+pub fn valid_diff_query(query:&Value)->bool {
+    query.as_object().is_some_and(|o|
+        o.keys().all(|k|matches!(k.as_str(),"path"|"base"|"context"))
+        && query["path"].as_str().is_some_and(valid_read_path)
+        && o.get("base").is_none_or(|v|matches!(v.as_str(),Some("head"|"staged"|"unstaged")))
+        && o.get("context").is_none_or(|v|v.as_u64().is_some_and(|n|n<=10)))
+}
+fn check_components(root:&Path,path:&str,allow_missing:bool)->Result<bool,String>{
+    let mut current=root.to_path_buf();
+    for part in path.split('/') {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(_)=>if reparse(&current)?{return Err("READ_REPARSE_POINT".into());},
+            Err(e) if allow_missing && e.kind()==std::io::ErrorKind::NotFound=>return Ok(false),
+            Err(_)=>return Err("READ_PATH_NOT_PERMITTED_OR_MISSING".into()),
+        }
+    }
+    Ok(true)
+}
+pub fn list_worker(root:&Path,query:&Value)->Result<Value,String>{
+    validate_root(root)?;
+    if !valid_list_query(query){return Err("INVALID_LIST_QUERY".into());}
+    let path=query["path"].as_str().unwrap_or(".");
+    let depth=query["depth"].as_u64().unwrap_or(1) as usize;
+    let limit=query["limit"].as_u64().unwrap_or(100) as usize;
+    let offset=query["offset"].as_u64().unwrap_or(0) as usize;
+    if path!="."{check_components(root,path,false)?;}
+    let dir=cap_std::fs::Dir::open_ambient_dir(root,cap_std::ambient_authority()).map_err(|_|"WORKSPACE_UNAVAILABLE")?;
+    let mut pending=vec![(if path=="."{String::new()}else{path.to_owned()},0usize)];
+    let mut entries=Vec::new();
+    let mut skipped=0usize;
+    let mut scanned=0usize;
+    let mut exhausted=false;
+    let deadline=Instant::now()+Duration::from_secs(4);
+    'walk: while let Some((parent,level))=pending.pop(){
+        let handle=if parent.is_empty(){dir.try_clone()}else{dir.open_dir(&parent)};
+        let handle=match handle{Ok(h)=>h,Err(_) if level>0=>{skipped+=1;continue;},Err(_)=>return Err("LIST_REQUIRES_DIRECTORY".into())};
+        let items=match handle.entries(){Ok(v)=>v,Err(_) if level>0=>{skipped+=1;continue;},Err(_)=>return Err("LIST_DIRECTORY_FAILED".into())};
+        for item in items {
+            if Instant::now()>=deadline || scanned>=20000 {exhausted=true;break 'walk;}
+            scanned+=1;
+            let Ok(item)=item else{skipped+=1;continue;};
+            let name=item.file_name();
+            let Some(name)=name.to_str()else{skipped+=1;continue;};
+            let relative=if parent.is_empty(){name.to_owned()}else{format!("{parent}/{name}")};
+            if !valid_read_path(&relative)||check_components(root,&relative,false).is_err(){skipped+=1;continue;}
+            let Ok(meta)=item.metadata()else{skipped+=1;continue;};
+            if !meta.is_dir()&&!meta.is_file(){skipped+=1;continue;}
+            if meta.is_dir()&&level+1<depth{pending.push((relative.clone(),level+1));}
+            entries.push((relative,meta.is_dir(),meta.len()));
+        }
+    }
+    entries.sort_unstable_by(|a,b|a.0.cmp(&b.0));
+    let count=entries.len();
+    let mut result=Vec::new();
+    let mut bytes=0;
+    for (path,directory,size) in entries.into_iter().skip(offset).take(limit){
+        let item=json!({"path":path,"kind":if directory{"directory"}else{"file"},"bytes":if directory{None}else{Some(size)}});
+        let n=serde_json::to_vec(&item).map_err(|_|"LIST_ENCODING_FAILED")?.len();
+        if bytes+n>48000{break;}
+        bytes+=n;result.push(item);
+    }
+    let next=offset+result.len();
+    Ok(json!({"path":path,"entries":result,"offset":offset,"scanned":scanned,"skipped":skipped,
+        "scan_budget_exhausted":exhausted,"truncated":exhausted||next<count,
+        "next_offset":if !exhausted&&next<count{Some(next)}else{None}}))
+}
+fn diff_blob(repo:&git2::Repository,id:git2::Oid,mode:i32)->Result<Vec<u8>,String>{
+    if !matches!(mode,0o100644|0o100755){return Err("DIFF_REQUIRES_REGULAR_FILE".into());}
+    let blob=repo.find_blob(id).map_err(|_|"DIFF_BLOB_UNAVAILABLE")?;
+    if blob.size()>256*1024{return Err("DIFF_FILE_LIMIT_256_KIB".into());}
+    Ok(blob.content().to_vec())
+}
+pub fn diff_worker(root:&Path,query:&Value)->Result<Value,String>{
+    validate_root(root)?;
+    if !valid_diff_query(query){return Err("INVALID_DIFF_QUERY".into());}
+    let path=query["path"].as_str().unwrap();
+    let base=query["base"].as_str().unwrap_or("head");
+    let repo=git2::Repository::open_ext(root,git2::RepositoryOpenFlags::NO_SEARCH,std::iter::empty::<&Path>()).map_err(|_|"GIT_REPOSITORY_INVALID")?;
+    if repo.workdir().and_then(|p|p.canonicalize().ok()).as_deref()!=Some(root)
+        || repo.path().canonicalize().ok()!=root.join(".git").canonicalize().ok(){return Err("GIT_WORKSPACE_MISMATCH".into());}
+    let rel=Path::new(path);
+    let head=match repo.head(){
+        Ok(h)=>Some(h.peel_to_commit().map_err(|_|"DIFF_HEAD_INVALID")?),
+        Err(e) if matches!(e.code(),git2::ErrorCode::UnbornBranch|git2::ErrorCode::NotFound)=>None,
+        Err(_)=>return Err("DIFF_HEAD_INVALID".into()),
+    };
+    let head_bytes=||->Result<Option<Vec<u8>>,String>{
+        let Some(commit)=&head else{return Ok(None);};
+        let tree=commit.tree().map_err(|_|"DIFF_TREE_INVALID")?;
+        match tree.get_path(rel){
+            Ok(entry)=>diff_blob(&repo,entry.id(),entry.filemode()).map(Some),
+            Err(e) if e.code()==git2::ErrorCode::NotFound=>Ok(None),
+            Err(_)=>Err("DIFF_TREE_PATH_INVALID".into()),
+        }
+    };
+    let index_bytes=||->Result<Option<Vec<u8>>,String>{
+        let index=repo.index().map_err(|_|"DIFF_INDEX_INVALID")?;
+        if (1..=3).any(|stage|index.get_path(rel,stage).is_some()){return Err("DIFF_INDEX_CONFLICT".into());}
+        index.get_path(rel,0).map(|e|diff_blob(&repo,e.id,e.mode as i32)).transpose()
+    };
+    let worktree_bytes=||->Result<Option<Vec<u8>>,String>{
+        if !check_components(root,path,true)?{return Ok(None);}
+        let dir=cap_std::fs::Dir::open_ambient_dir(root,cap_std::ambient_authority()).map_err(|_|"WORKSPACE_UNAVAILABLE")?;
+        let file=dir.open(path).map_err(|_|"DIFF_FILE_UNAVAILABLE")?;
+        let meta=file.metadata().map_err(|_|"DIFF_METADATA_FAILED")?;
+        if !meta.is_file(){return Err("DIFF_REQUIRES_REGULAR_FILE".into());}
+        if meta.len()>256*1024{return Err("DIFF_FILE_LIMIT_256_KIB".into());}
+        let mut bytes=Vec::new();
+        file.take(256*1024+1).read_to_end(&mut bytes).map_err(|_|"DIFF_READ_FAILED")?;
+        if bytes.len()>256*1024{return Err("DIFF_FILE_LIMIT_256_KIB".into());}
+        Ok(Some(bytes))
+    };
+    // Compare captured bytes rather than allowing Git to invoke filters,
+    // external diff drivers, follow worktree links, or read arbitrary paths.
+    let (old,new)=match base{
+        "staged"=>(head_bytes()?,index_bytes()?),
+        "unstaged"=>(index_bytes()?,worktree_bytes()?),
+        _=>(head_bytes()?,worktree_bytes()?),
+    };
+    if old.is_none()&&new.is_none(){return Err("DIFF_PATH_NOT_FOUND".into());}
+    let old_exists=old.is_some();let new_exists=new.is_some();
+    let a=old.as_deref().unwrap_or(&[]);let b=new.as_deref().unwrap_or(&[]);
+    let binary=[a,b].iter().any(|v|v.contains(&0)||std::str::from_utf8(v).is_err());
+    let changed=old!=new;
+    let mut diff=String::new();let mut truncated=false;
+    if changed&&!binary {
+        let mut opts=git2::DiffOptions::new();
+        opts.context_lines(query["context"].as_u64().unwrap_or(3) as u32);
+        let mut patch=git2::Patch::from_buffers(a,old_exists.then_some(rel),b,new_exists.then_some(rel),Some(&mut opts))
+            .map_err(|_|"DIFF_GENERATION_FAILED")?;
+        let buf=patch.to_buf().map_err(|_|"DIFF_GENERATION_FAILED")?;
+        let text=std::str::from_utf8(buf.as_ref()).map_err(|_|"DIFF_ENCODING_FAILED")?;
+        let mut escaped=0;
+        for line in text.split_inclusive('\n'){
+            let n=serde_json::to_vec(line).map_err(|_|"DIFF_ENCODING_FAILED")?.len().saturating_sub(2);
+            if escaped+n>48000{truncated=true;break;}
+            escaped+=n;diff.push_str(line);
+        }
+    }
+    Ok(json!({"path":path,"base":base,"head":head.map(|c|c.id().to_string()),"changed":changed,
+        "old_exists":old_exists,"new_exists":new_exists,"binary":binary,"diff":diff,"truncated":truncated,
+        "old_bytes":a.len(),"new_bytes":b.len()}))
+}
+pub fn fs_list(root:&Path,args:&Value)->Result<Value,String>{
+    if args.as_object().is_none_or(|o|o.len()!=1)||!valid_list_query(&args["query"]){return Err("INVALID_LIST_QUERY".into());}
+    run_worker(root,"--readonly-list-worker",Some(&args["query"].to_string()))
+}
+pub fn git_diff(root:&Path,args:&Value)->Result<Value,String>{
+    if args.as_object().is_none_or(|o|o.len()!=1)||!valid_diff_query(&args["query"]){return Err("INVALID_DIFF_QUERY".into());}
+    run_worker(root,"--readonly-diff-worker",Some(&args["query"].to_string()))
+}
 pub fn fs_read(root: &Path, args: &Value) -> Result<Value, String> {
     if !valid_read_args(args) {return Err("INVALID_READ_ARGUMENTS".into());}
     let query=serde_json::to_string(args).map_err(|_|"INVALID_READ_ARGUMENTS")?;
@@ -390,6 +550,34 @@ fn run_worker(root: &Path, mode: &str, path: Option<&str>) -> Result<Value, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn directory_queries_enforce_path_and_budget() {
+        let tmp=tempfile::tempdir().unwrap();
+        git2::Repository::init(tmp.path()).unwrap();
+        let root=tmp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/one.txt"),"one").unwrap();
+        fs::write(root.join("two.txt"),"two").unwrap();
+        let first=list_worker(&root,&json!({"depth":2,"limit":1})).unwrap();
+        let next=list_worker(&root,&json!({"depth":2,"offset":first["next_offset"]})).unwrap();
+        assert_eq!(first["entries"][0]["path"],"sub");
+        assert_eq!(next["entries"][0]["path"],"sub/one.txt");
+        assert_eq!(next["entries"][1]["path"],"two.txt");
+        for q in [json!({"path":"../"}),json!({"path":".git"}),json!({"depth":6}),
+            json!({"limit":0}),json!({"offset":20001}),json!({"unknown":true})] {
+            assert!(list_worker(&root,&q).is_err(),"{q}");
+        }
+        assert!(list_worker(&root,&json!({"path":"two.txt"})).is_err());
+        assert!(diff_worker(&root,&json!({"path":"../outside"})).is_err());
+        assert!(diff_worker(&root,&json!({"path":"two.txt","base":"arbitrary"})).is_err());
+        assert!(diff_worker(&root,&json!({"path":"two.txt","context":11})).is_err());
+        let diff=diff_worker(&root,&json!({"path":"two.txt"})).unwrap();
+        assert_eq!(diff["old_exists"],false);
+        assert_eq!(diff["new_exists"],true);
+        assert!(diff["diff"].as_str().unwrap().contains("+two"));
+        fs::write(root.join("big.txt"),vec![b'a';256*1024+1]).unwrap();
+        assert!(diff_worker(&root,&json!({"path":"big.txt"})).is_err());
+    }
     #[test]
     fn file_read_is_bounded_and_rejects_traversal_and_git_metadata() {
         let tmp = tempfile::tempdir().unwrap();

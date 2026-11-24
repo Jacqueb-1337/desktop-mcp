@@ -490,6 +490,8 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     "git_status"=>crate::readonly::git_status(agent.root(),&frame["arguments"]),
                     "fs_search"=>policy.search_worker.query(agent.root(),&frame["arguments"]),
                     "fs_read"=>crate::readonly::fs_read(agent.root(),&frame["arguments"]),
+                    "fs_list"=>crate::readonly::fs_list(agent.root(),&frame["arguments"]),
+                    "git_diff"=>crate::readonly::git_diff(agent.root(),&frame["arguments"]),
                     _=>Err("UNSUPPORTED_READ_TOOL".into())
                 } {
                     Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
