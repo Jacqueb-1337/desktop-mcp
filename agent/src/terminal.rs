@@ -120,9 +120,11 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
     $__dmcp_input = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__dmcp_line)) | ConvertFrom-Json
     $global:LASTEXITCODE = 0
     try {
-        . ([ScriptBlock]::Create($__dmcp_input.command))
-        $__dmcp_ok = $?
-        $__dmcp_exit = $global:LASTEXITCODE
+        . {
+            . ([ScriptBlock]::Create($__dmcp_input.command))
+            $__dmcp_ok = $?
+            $__dmcp_exit = $global:LASTEXITCODE
+        } | Out-Default
         if (!$__dmcp_ok -and $__dmcp_exit -eq 0) { $__dmcp_exit = 1 }
     } catch {
         [Console]::Error.WriteLine($_.ToString())
@@ -660,6 +662,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
             if !matches!(child.try_wait(), Ok(None)) {
                 break "shell_exited";
             }
+            let mut drained = 0;
             for _ in 0..32 {
                 let Ok((is_stdout, bytes)) = output.try_recv() else {
                     break;
@@ -667,6 +670,7 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 let Ok(mut entry) = record.lock() else {
                     return;
                 };
+                drained += 1;
                 let marker = if is_stdout {
                     current.and_then(|(id, _)| {
                         let prefix = format!("__DMCP_DONE__{id}:");
@@ -702,7 +706,9 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 dirty = false;
                 checkpoint = Instant::now();
             }
-            thread::sleep(Duration::from_millis(100));
+            if drained < 32 {
+                thread::sleep(Duration::from_millis(100));
+            }
         };
         drop(input_send);
         drop(job);
@@ -770,6 +776,9 @@ while ($null -ne ($__dmcp_line = [Console]::ReadLine())) {
                 "{output:?}"
             );
             assert_eq!(code, 7);
+            let (output, code) = send(&mut stdin, "[pscustomobject]@{ Label = 'formatted-before-done' }; Write-Output 'end-of-result'");
+            assert_eq!(code, 0);
+            assert!(output.contains("formatted-before-done") && output.contains("end-of-result"), "{output:?}");
             drop(job);
             let _ = child.wait().unwrap();
             worker.join().unwrap();

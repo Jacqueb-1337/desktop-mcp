@@ -179,7 +179,9 @@ if route_enabled {
                 "route_denial_sent":route_enabled
             }));
         }
-        thread::sleep(Duration::from_secs(4));
+        if ack.get("route").is_none() {
+            thread::sleep(Duration::from_secs(4));
+        }
     }
 }
 
@@ -215,10 +217,12 @@ fn scoped_route(tls:&mut (impl Read + Write),state:&Path,frame:&Value,host:&str)
 pub fn reconnect_forever(target: &GatewayTarget<'_>) -> ! {
     let mut delay=1;
     loop {
+        let started = std::time::Instant::now();
         match connect(target,false) {
             Ok(_)=>{},
             Err(e)=>eprintln!("Gateway presence disconnected: {e}"),
         }
+        if started.elapsed() >= Duration::from_secs(30) { delay = 1; }
         thread::sleep(Duration::from_secs(delay));
         delay=(delay*2).min(30);
     }

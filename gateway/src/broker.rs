@@ -272,7 +272,10 @@ impl Broker {
             response,
             canceled: canceled.clone(),
         })
-        .map_err(|_| "HOST_BUSY_OR_DISCONNECTED")?;
+        .map_err(|err| match err {
+            mpsc::TrySendError::Full(_) => "HOST_BUSY",
+            mpsc::TrySendError::Disconnected(_) => "HOST_DISCONNECTED",
+        })?;
         let started = std::time::Instant::now();
         let result = loop {
             if !alive() || started.elapsed() >= Duration::from_secs(110) {
