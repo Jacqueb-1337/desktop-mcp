@@ -643,6 +643,49 @@ mod tests {
         assert!(!crate::policy::valid_snapshot_args(&json!({"paths":["../evil"],"message":"snapshot"})));
     }
     #[test]
+    fn independent_rpc_dispatches_overlap() {
+        // No desktop connection or real execution: each dispatch merely
+        // announces arrival and waits for a bounded test-only release signal.
+        use std::sync::{mpsc,Mutex};
+        let (arrived_tx,arrived_rx)=mpsc::channel();
+        let release=Arc::new((Mutex::new(false),std::sync::Condvar::new()));
+        let gate=release.clone();
+        let dispatch:Dispatch=Arc::new(move|_,args,_|{
+            arrived_tx.send(args["host_id"].clone()).unwrap();
+            let (lock,cv)=&*gate;
+            let guard=lock.lock().unwrap();
+            let _guard=cv.wait_timeout_while(guard,Duration::from_secs(3),|open|!*open).unwrap();
+            Ok(json!({"simulated":true}))
+        });
+        let workers:Vec<_>=(1..=3).map(|id|{
+            let dispatch=dispatch.clone();
+            thread::spawn(move||{
+                let mut r=request();
+                r["id"]=json!(id);
+                r["method"]=json!("tools/call");
+                r["params"]["name"]=json!("git_status");
+                r["params"]["arguments"]=json!({"host_id":"ab".repeat(16),"workspace_id":"default"});
+                let mut h=headers();
+                h.insert("mcp-method".into(),"tools/call".into());
+                h.insert("mcp-name".into(),"git_status".into());
+                rpc(r,&h,&dispatch,&||true)
+            })
+        }).collect();
+        let deadline=std::time::Instant::now()+Duration::from_secs(2);
+        let mut arrivals=0;
+        while arrivals<3 && arrived_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_ok() {
+            arrivals+=1;
+        }
+        *release.0.lock().unwrap()=true;
+        release.1.notify_all();
+        for worker in workers {
+            let (status,body)=worker.join().unwrap();
+            assert_eq!(status,200);
+            assert_eq!(body.unwrap()["result"]["structuredContent"]["simulated"],true);
+        }
+        assert_eq!(arrivals,3,"RPC calls must enter dispatch before any finishes");
+    }
+    #[test]
     fn modern_discovery_and_validation() {
         assert_eq!(rpc(request(), &headers(), &dispatch(), &|| true).0, 200);
         let mut h = headers();

@@ -216,6 +216,24 @@ mod tests {
             workspace_id:"default".into(),tool:tool.into()}
     }
     #[test]
+    fn complete_capability_list_retains_local_approval_requirement() {
+        let mut p=policy();
+        let tools=["git_status","fs_read","use_repository","git_snapshot","patch_prepare","patch_review",
+            "patch_status","patch_apply","git_commit_patch","request_permission","system_volume_status",
+            "admin_command","user_command","elevated_user_command"];
+        p.hosts[0].tools=tools.iter().map(|t|t.to_string()).collect();
+        assert!(p.validate().is_ok());
+        for t in tools {
+            assert_eq!(p.decide(&intent(A,t),A),Decision::RequiresLocalApproval);
+            assert_eq!(p.decide(&intent(B,t),A),Decision::Denied);
+        }
+        p.hosts[0].tools.push("user_command".into());
+        assert!(p.validate().is_err());
+        p.hosts[0].tools.pop();
+        p.hosts[0].tools[13]="unknown_capability".into();
+        assert!(p.validate().is_err());
+    }
+    #[test]
     fn exact_target_never_grants_execution(){
         assert_eq!(policy().decide(&intent(A,"fs_read"),A),Decision::RequiresLocalApproval);
         assert_eq!(policy().decide(&intent(B,"fs_read"),A),Decision::Denied);
