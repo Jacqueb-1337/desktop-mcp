@@ -471,6 +471,18 @@ fn private_address(ip: IpAddr) -> bool {
 }
 
 fn run() -> Result<(), String> {
+    // Separate, offline-only CLI: no listeners, execution or policy writes.
+    let raw:Vec<String>=std::env::args().skip(1).collect();
+    if raw.first().is_some_and(|arg|arg=="--review-upgrade") {
+        if !matches!(raw.len(),2|3) {return Err("REVIEW_UPGRADE_REQUIRES_CURRENT_AND_OPTIONAL_PROPOSED_POLICY".into());}
+        let read=|name:&str|->Result<policy::PolicyFile,String>{
+            serde_json::from_slice(&secure_file(Path::new(name))?).map_err(|_|"POLICY_INVALID".into())
+        };
+        let current=read(&raw[1])?;
+        let proposed=raw.get(2).map(|name|read(name)).transpose()?;
+        println!("{}",policy::upgrade_review(&current,proposed.as_ref())?);
+        return Ok(());
+    }
     let mut args=std::env::args().skip(1);
     let mut listen:SocketAddr="127.0.0.1:0".parse().unwrap();
     let mut cert=None;

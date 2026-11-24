@@ -83,3 +83,21 @@ documented in [WINDOWS-UPGRADE.md](WINDOWS-UPGRADE.md). Its detected-failure
 rollback and disposable local Windows tests pass. A protected service update,
 reboot, and genuine WAN Windows test are still required before production use.
 Do not distribute a development installer as production-ready.
+
+## Offline upgrade compatibility review
+
+Before replacing a gateway binary, run the candidate build's offline review
+against a disposable copy of the current policy. An optional independently
+prepared proposed policy can be compared in the same command:
+
+    desktop-mcp-gateway --review-upgrade current-copy.json
+    desktop-mcp-gateway --review-upgrade current-copy.json proposed-copy.json
+
+The versioned JSON report validates both inputs and identifies added or
+removed host scopes and capabilities. Any authorization difference requires
+administrator review. The command does not modify either file, start a
+listener, grant access, or generate a replacement authorization policy.
+Unsupported versions and malformed policies fail closed. A legacy policy
+with fewer capabilities remains valid; its existing authorization choices
+are preserved. Capability changes are separate from binary deployment and
+must remain subject to the administrator's established approval process.

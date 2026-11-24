@@ -127,6 +127,40 @@ impl PolicyFile {
     }
 }
 
+/// Read-only upgrade review. A valid legacy policy is not an error, and
+/// a review can never change the configured scopes or authorize execution.
+pub fn upgrade_review(current:&PolicyFile, proposed:Option<&PolicyFile>)->Result<Value,String>{
+    current.validate()?;
+    if let Some(next)=proposed {next.validate()?;}
+    let next=proposed.unwrap_or(current);
+    let capabilities=|p:&PolicyFile|->HashSet<(String,String,String)> {
+        p.hosts.iter().flat_map(|host|host.tools.iter().map(move |tool|
+            (host.host_id.clone(),host.workspace_id.clone(),tool.clone()))).collect()
+    };
+    let before=capabilities(current);
+    let after=capabilities(next);
+    let mut added:Vec<_>=after.difference(&before).cloned().collect();
+    let mut removed:Vec<_>=before.difference(&after).cloned().collect();
+    added.sort();
+    removed.sort();
+    let mut added_hosts:Vec<_>=next.hosts.iter().filter(|h|!current.hosts.iter().any(|old|
+        old.host_id==h.host_id && old.workspace_id==h.workspace_id)).map(|h|h.host_id.clone()).collect();
+    let mut removed_hosts:Vec<_>=current.hosts.iter().filter(|h|!next.hosts.iter().any(|new|
+        new.host_id==h.host_id && new.workspace_id==h.workspace_id)).map(|h|h.host_id.clone()).collect();
+    added_hosts.sort();
+    removed_hosts.sort();
+    let changes=|rows:Vec<(String,String,String)>|rows.into_iter().map(|(host,workspace,capability)|
+        json!({"host_id":host,"workspace_id":workspace,"capability":capability})).collect::<Vec<_>>();
+    let requires_review=!added.is_empty() || !removed.is_empty() || !added_hosts.is_empty() || !removed_hosts.is_empty();
+    Ok(json!({"report_version":1,"current_policy_version":current.version,
+        "proposed_policy_version":next.version,"compatible":true,
+        "current_scope_count":before.len(),"proposed_scope_count":after.len(),
+        "administrator_review_required":requires_review,
+        "added_scopes":changes(added),"removed_scopes":changes(removed),
+        "added_hosts":added_hosts,"removed_hosts":removed_hosts,
+        "configuration_changed":false,"authorization_granted":false}))
+}
+
 /// In-memory, bounded request deduplication for future authenticated routing.
 /// This is not durable replay protection; a gateway restart clears this ledger.
 /// A matching request still requires separate approval on its target host.
@@ -232,6 +266,35 @@ mod tests {
         p.hosts[0].tools.pop();
         p.hosts[0].tools[13]="unknown_capability".into();
         assert!(p.validate().is_err());
+    }
+    #[test]
+    fn upgrade_review_preserves_legacy_and_reports_explicit_differences(){
+        let original=policy();
+        let snapshot=serde_json::to_vec(&original).unwrap();
+        let same=upgrade_review(&original,None).unwrap();
+        assert_eq!(same["administrator_review_required"],false);
+        let mut candidate=original.clone();
+        candidate.hosts[0].tools=vec!["fs_read".into(),"git_snapshot".into()];
+        let review=upgrade_review(&original,Some(&candidate)).unwrap();
+        assert_eq!(review["administrator_review_required"],true);
+        assert_eq!(review["added_scopes"][0]["capability"],"git_snapshot");
+        assert_eq!(review["removed_scopes"][0]["capability"],"git_status");
+        assert_eq!(review["configuration_changed"],false);
+        assert_eq!(review["authorization_granted"],false);
+        assert_eq!(serde_json::to_vec(&original).unwrap(),snapshot);
+        assert_eq!(original.decide(&intent(A,"git_snapshot"),A),Decision::Denied);
+    }
+    #[test]
+    fn upgrade_review_rejects_invalid_and_detects_empty_host_changes(){
+        let original=policy();
+        let mut candidate=original.clone();
+        candidate.hosts.push(HostScope{host_id:B.into(),workspace_id:"default".into(),tools:vec![]});
+        let review=upgrade_review(&original,Some(&candidate)).unwrap();
+        assert_eq!(review["administrator_review_required"],true);
+        assert_eq!(review["added_hosts"][0],B);
+        candidate.version=999;
+        assert!(upgrade_review(&original,Some(&candidate)).is_err());
+        assert!(upgrade_review(&candidate,None).is_err());
     }
     #[test]
     fn exact_target_never_grants_execution(){
