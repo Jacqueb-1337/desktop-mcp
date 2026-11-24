@@ -61,8 +61,10 @@ def main():
     legacy = None
     while line := sys.stdin.buffer.readline(LIMIT + 1):
         if len(line) > LIMIT:
+            while line and not line.endswith(b"\n"):
+                line = sys.stdin.buffer.readline(LIMIT + 1)
             emit(error("Request exceeds bridge limit", code=-32600))
-            return 2
+            continue
         try:
             message = json.loads(line)
             if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
