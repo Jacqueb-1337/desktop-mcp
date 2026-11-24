@@ -39,7 +39,7 @@ struct Policy {
     admin_enabled:bool,
     admin_commands_enabled:bool,
     admin_run:Option<elevation::Run>,
-    system_run:Option<unattended::Task>,
+    system_runs:std::collections::HashMap<String,unattended::Task>,
     terminals:crate::terminal::Pool,
     system_request:Option<Value>,
     system_command:Option<(Value, uuid::Uuid)>,
@@ -58,7 +58,7 @@ impl Default for Policy {
             admin_enabled:false,
             admin_commands_enabled:false,
             admin_run:None,
-            system_run:None,
+            system_runs:std::collections::HashMap::new(),
             terminals:crate::terminal::Pool::default(),
             system_request:None,
             system_command:None,
@@ -254,7 +254,11 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
             if enabled && !remote_capable {return json!({"error":"REMOTE_READONLY_NOT_ENABLED_AT_LAUNCH"});}
             if !enabled {policy.remote_reads_enabled=false;policy.admin_run=None;policy.terminals.close_all();}
             if let Err(error)=persist_remote_gate(dir,enabled){return json!({"error":error});}
-            if !enabled {if let Err(error)=inbox.clear(){return json!({"error":error});}}
+            if !enabled {
+                policy.system_runs.clear();
+                policy.system_command=None;
+                if let Err(error)=inbox.clear(){return json!({"error":error});}
+            }
             policy.remote_reads_enabled=enabled;json!({"enabled":enabled})
         },
         "set_policy" => {
@@ -287,7 +291,8 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 if route["version"]!=2 || !policy.admin_commands_enabled {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 }
-                if tool=="request_permission" && capability==elevation::COMMAND {
+                if tool=="request_permission" && matches!(capability,elevation::COMMAND|crate::user_command::TOOL) {
+                    if policy.system_request.is_some() {return json!({"error":"SYSTEM_PERMISSION_BUSY"});}
                     let scope=agent.authorization_scope().to_str().unwrap_or("");
                     return match inbox.stage(route,Some(scope)).and_then(|queued| {
                         unattended::stage_request(dir,route)?;
@@ -298,13 +303,13 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                         Err(error)=>json!({"error":error}),
                     };
                 }
-                if !matches!(tool,elevation::COMMAND|"admin_command_result") && !crate::terminal::is_tool(tool) {
+                if !matches!(tool,elevation::COMMAND|"admin_command_result"|crate::user_command::TOOL|crate::user_command::RESULT) && !crate::terminal::is_tool(tool) {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 }
-                let Some(grant)=unattended::grant_id(dir,host) else {
+                let Some(grant)=unattended::grant_id_for(dir,host,tool) else {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 };
-                if policy.system_run.is_some() {
+                if matches!(tool,elevation::COMMAND|crate::user_command::TOOL) && policy.system_runs.len()>=4 {
                     return json!({"error":"SYSTEM_COMMAND_BUSY"});
                 }
                 return match inbox.approve_automatic(route) {
@@ -315,7 +320,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     Err(error)=>json!({"error":error}),
                 };
             }
-            if tool=="admin_command_result" || crate::terminal::is_tool(tool) {return json!({"error":"LOCAL_PERMISSION_REQUIRED"});}
+            if matches!(tool,"admin_command_result"|crate::user_command::TOOL|crate::user_command::RESULT) || (tool=="request_permission" && capability==crate::user_command::TOOL) || crate::terminal::is_tool(tool) {return json!({"error":"LOCAL_PERMISSION_REQUIRED"});}
             if elevation::is_privileged(capability) && !policy.privileged_enabled(capability) {
                 return json!({"error":"ADMIN_HELPER_UNAVAILABLE"});
             }
@@ -351,8 +356,8 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
             if policy.system_command.as_ref().is_some_and(|(staged,_)|staged==frame) {
                 policy.system_command=None;
             }
-            if policy.system_run.as_ref().is_some_and(|run|run.matches(frame)) {
-                policy.system_run=None;
+            if let Some(id)=frame["request_id"].as_str() {
+                if policy.system_runs.get(id).is_some_and(|run|run.matches(frame)) {policy.system_runs.remove(id);}
             }
             if policy.admin_run.as_ref().is_some_and(|run| run.matches(&value["route"])) {
                 policy.admin_run = None;
@@ -384,16 +389,17 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     });
                     return match outcome {
                         Ok(())=>json!({"pending":false,"executed":true,"data":{
-                            "capability":elevation::COMMAND,"duration":frame["arguments"]["duration"],
+                            "capability":frame["arguments"]["capability"],"duration":frame["arguments"]["duration"],
                             "granted":true,"unattended":true
                         }}),
                         Err(error)=>rejected(error),
                     };
                 }
-                if let Some(run)=policy.system_run.as_ref() {
-                    if !run.matches(frame) {return rejected("SYSTEM_COMMAND_BUSY".into());}
+                let run_id=frame["request_id"].as_str().unwrap_or("").to_owned();
+                if let Some(run)=policy.system_runs.get(&run_id) {
+                    if !run.matches(frame) {return rejected("APPROVAL_REQUEST_MISMATCH".into());}
                     let result=run.poll();
-                    if result["pending"]!=true {policy.system_run=None;}
+                    if result["pending"]!=true {policy.system_runs.remove(&run_id);}
                     return result;
                 }
                 let Some((staged,grant))=policy.system_command.as_ref() else {
@@ -402,7 +408,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 if staged!=frame {return rejected("APPROVAL_REQUEST_MISMATCH".into());}
                 let grant=*grant;
                 policy.system_command=None;
-                if unattended::grant_id(dir,&host_id)!=Some(grant) {
+                if unattended::grant_id_for(dir,&host_id,tool)!=Some(grant) {
                     return rejected("UNATTENDED_GRANT_INACTIVE".into());
                 }
                 if crate::terminal::is_tool(tool) {
@@ -414,7 +420,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                         Err(error)=>rejected(error),
                     };
                 }
-                if tool=="admin_command_result" {
+                if matches!(tool,"admin_command_result"|crate::user_command::RESULT) {
                     return match inbox.consume(frame).and_then(|spent| {
                         if !spent {return Err("LOCAL_APPROVAL_REQUIRED".into());}
                         unattended::command_result(dir,grant,&frame["arguments"]["run_id"])
@@ -425,9 +431,10 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 }
                 return match inbox.consume(frame).and_then(|spent| {
                     if !spent {return Err("LOCAL_APPROVAL_REQUIRED".into());}
+                    if policy.system_runs.len()>=4 {return Err("SYSTEM_COMMAND_BUSY".into());}
                     unattended::Task::start(frame,dir,&host_id,grant)
                 }) {
-                    Ok(run)=>{policy.system_run=Some(run);json!({"pending":true})},
+                    Ok(run)=>{policy.system_runs.insert(run_id,run);json!({"pending":true})},
                     Err(error)=>rejected(error),
                 };
             }

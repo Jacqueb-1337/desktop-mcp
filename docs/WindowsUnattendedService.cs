@@ -132,6 +132,9 @@ internal sealed class DesktopService : ServiceBase
                 var id=(string)request["request_id"];
                 var host=(string)request["host_id"];
                 var duration=(string)request["duration"];
+                object requestedCapability;
+                string capability=request.TryGetValue("capability",out requestedCapability)?requestedCapability as string:"admin_command";
+                if(capability!="admin_command" && capability!="user_command") {Thread.Sleep(250);continue;}
                 long remaining=Convert.ToInt64(request["expires_at"])-Now();
                 Guid requestId;
                 if(id==lastRequest || remaining<=0 || remaining>120 ||
@@ -155,8 +158,13 @@ internal sealed class DesktopService : ServiceBase
                 var config=json.Deserialize<Dictionary<string,string>>(File.ReadAllText(Path.Combine(DataRoot,"gateway.json")));
                 uint session=WTSGetActiveConsoleSessionId();
                 if(!SessionBelongsTo(session,config["ownerSid"])) {Thread.Sleep(250);continue;}
-                string title="Desktop MCP: unattended administrator access";
-                string message="Your paired ChatGPT controller requests Windows SYSTEM command access "+time+".\n\n"
+                bool userContext=capability=="user_command";
+                string title=userContext?"Desktop MCP: user account access":"Desktop MCP: unattended administrator access";
+                string message=userContext
+                    ?"Your paired ChatGPT controller requests standard-user command access to your signed-in Windows account "+time+".\n\n"
+                    +"This includes access to your user files, development tools and connected network drives. No SYSTEM elevation is granted by this permission. "
+                    +"Use the Desktop MCP revoke shortcut to end access.\n\nAllow this request?"
+                    :"Your paired ChatGPT controller requests Windows SYSTEM command access "+time+".\n\n"
                     +"If you approve, it can run elevated commands without further prompts, including after sign-out "
                     +"and reboot. Use the Desktop MCP revoke shortcut to end access.\n\nAllow this request?";
                 uint response;
@@ -169,7 +177,7 @@ internal sealed class DesktopService : ServiceBase
                     !SessionBelongsTo(session,config["ownerSid"]))continue;
                 string temporary=decisionPath+"."+Guid.NewGuid().ToString("N")+".tmp";
                 try {
-                    File.WriteAllText(temporary,json.Serialize(new {request_id=id,approved=response==6}));
+                    File.WriteAllText(temporary,json.Serialize(new {request_id=id,capability=capability,approved=response==6}));
                     if(File.Exists(decisionPath))File.Replace(temporary,decisionPath,null);
                     else File.Move(temporary,decisionPath);
                 } finally {if(File.Exists(temporary))File.Delete(temporary);}
@@ -307,6 +315,7 @@ internal sealed class DesktopService : ServiceBase
         var serviceAcl=File.GetAccessControl(ServiceExe);
         serviceAcl.AddAccessRule(new FileSystemAccessRule(owner,FileSystemRights.ReadAndExecute,AccessControlType.Allow));
         File.SetAccessControl(ServiceExe,serviceAcl);
+        AllowOwnerWorkerExecution(new SecurityIdentifier(owner.Value));
         // The tray can read audit metadata without access to service state or secrets.
         string audit=Path.Combine(State,"unattended-audit.jsonl");
         using(File.Open(audit,FileMode.OpenOrCreate,FileAccess.Write,FileShare.Read)) {}
@@ -351,6 +360,14 @@ internal sealed class DesktopService : ServiceBase
             +"After pairing, ChatGPT can request unattended administrator access for you to approve.",
             "Desktop MCP Service",MessageBoxButtons.OK,MessageBoxIcon.Information);
     }
+    private static void AllowOwnerWorkerExecution(SecurityIdentifier owner)
+    {
+        BinaryUpgradeTransaction.CheckOrdinaryFile(Agent);
+        var acl=File.GetAccessControl(Agent);
+        acl.SetAccessRule(new FileSystemAccessRule(owner,FileSystemRights.ReadAndExecute,AccessControlType.Allow));
+        File.SetAccessControl(Agent,acl);
+    }
+
     // UAC-approved in-place upgrade. Machine state and existing grants are never copied
     // from a user folder or rewritten. Only two binaries are permitted to change.
     private static void UpgradeMachine(string userState)
@@ -393,14 +410,30 @@ internal sealed class DesktopService : ServiceBase
         if(!EqualBytes(Hash(caBytes),Hash(File.ReadAllBytes(Ca))))
             throw new InvalidDataException("Gateway TLS CA differs. Reprovision trust explicitly.");
         var installed=Assembly.Load(File.ReadAllBytes(ServiceExe));
-        bool direct=Array.IndexOf(installed.GetManifestResourceNames(),"gateway-wg-public")<0;
+        bool legacyDirect=Array.IndexOf(installed.GetManifestResourceNames(),"gateway-wg-public")<0;
+        string directPinPath=Path.Combine(DataRoot,"direct-route-pin.json");
+        bool pinnedDirect=File.Exists(directPinPath);
+        bool direct=legacyDirect || pinnedDirect;
+        string caDigest=Convert.ToBase64String(Hash(File.ReadAllBytes(Ca)));
         if(direct && WireGuardTunnelInstaller.TunnelServiceExists())
             throw new InvalidDataException("Existing WireGuard service has no verifiable pin.");
-        var routeSource=direct ? installed : Assembly.GetExecutingAssembly();
-        using(var cfg=routeSource.GetManifestResourceStream("gateway"))
-        using(var reader=new StreamReader(cfg))
-            if(reader.ReadLine()!=config["address"] || reader.ReadLine()!=config["tlsName"])
-                throw new InvalidDataException("Gateway TLS address differs. Refusing silent redirection.");
+        if(pinnedDirect)
+        {
+            BinaryUpgradeTransaction.CheckOrdinaryFile(directPinPath);
+            if(new FileInfo(directPinPath).Length>4096)throw new InvalidDataException("Invalid direct route pin.");
+            var pin=json.Deserialize<Dictionary<string,string>>(File.ReadAllText(directPinPath));
+            if(pin==null || pin.Count!=3 || pin["address"]!=config["address"] ||
+                pin["tlsName"]!=config["tlsName"] || pin["caSha256"]!=caDigest)
+                throw new InvalidDataException("Direct gateway route pin differs.");
+        }
+        if(!pinnedDirect || legacyDirect)
+        {
+            var routeSource=legacyDirect ? installed : Assembly.GetExecutingAssembly();
+            using(var cfg=routeSource.GetManifestResourceStream("gateway"))
+            using(var reader=new StreamReader(cfg))
+                if(reader.ReadLine()!=config["address"] || reader.ReadLine()!=config["tlsName"])
+                    throw new InvalidDataException("Gateway TLS address differs. Refusing silent redirection.");
+        }
         string trustedKey=WireGuardTunnelInstaller.EmbeddedGatewayPublicKey();
         // WireGuard for Windows can protect and relocate tunnel configurations after
         // installation. Compare the PUBLIC key inside the previously installed,
@@ -424,14 +457,28 @@ internal sealed class DesktopService : ServiceBase
             if(service.Status!=ServiceControllerStatus.Running)
                 throw new InvalidOperationException("Service is not running. Start it before upgrading.");
             var tx=new BinaryUpgradeTransaction(InstallRoot);
+            bool createdDirectPin=false;
             try
             {
+                // For legacy direct installs, migrate the already-verified embedded
+                // route to an administrator-owned pin before replacing the supervisor.
+                // This never changes gateway.json, CA, pairing or tunnel configuration.
+                if(legacyDirect && !pinnedDirect)
+                {
+                    using(var pinStream=new FileStream(directPinPath,FileMode.CreateNew,FileAccess.Write,FileShare.None))
+                    using(var writer=new StreamWriter(pinStream))
+                    {
+                        createdDirectPin=true;
+                        writer.Write(json.Serialize(new {address=config["address"],tlsName=config["tlsName"],caSha256=caDigest}));
+                        writer.Flush();pinStream.Flush(true);
+                    }
+                }
                 tx.Stage(Path.GetFileName(Agent),ReadEmbeddedResource("agent"),false);
-                // Preserve the supervisor that pins the original direct-route profile.
-                if(!direct)tx.Stage(Path.GetFileName(ServiceExe),File.ReadAllBytes(Assembly.GetExecutingAssembly().Location),false);
+                tx.Stage(Path.GetFileName(ServiceExe),File.ReadAllBytes(Assembly.GetExecutingAssembly().Location),false);
                 service.Stop();
                 service.WaitForStatus(ServiceControllerStatus.Stopped,TimeSpan.FromSeconds(20));
                 tx.Apply();
+                AllowOwnerWorkerExecution(new SecurityIdentifier(ownerSid));
                 service.Start();
                 service.WaitForStatus(ServiceControllerStatus.Running,TimeSpan.FromSeconds(20));
                 Thread.Sleep(900);
@@ -451,6 +498,7 @@ internal sealed class DesktopService : ServiceBase
                         service.WaitForStatus(ServiceControllerStatus.Stopped,TimeSpan.FromSeconds(20));
                     }
                     tx.Rollback();
+                    if(createdDirectPin)File.Delete(directPinPath);
                     service.Start();
                     service.WaitForStatus(ServiceControllerStatus.Running,TimeSpan.FromSeconds(20));
                 }
@@ -573,10 +621,12 @@ internal sealed class DesktopService : ServiceBase
     private static void RevokeAccess()
     {
         RequireAdministrator();
-        if(MessageBox.Show("Immediately revoke unattended administrator access?",
+        if(MessageBox.Show("Immediately revoke unattended administrator and user account access?",
             "Desktop MCP",MessageBoxButtons.YesNo,MessageBoxIcon.Warning)!=DialogResult.Yes)return;
         File.Delete(Path.Combine(State,"owner-request.json"));
         if(File.Exists(Grant))File.Delete(Grant);
+        string userGrant=Path.Combine(DataRoot,"user-grant.json");
+        if(File.Exists(userGrant))File.Delete(userGrant);
         File.AppendAllText(Path.Combine(DataRoot,"owner-grants.jsonl"),
             new JavaScriptSerializer().Serialize(new {at=Now(),event_type="revoke"})+"\n");
         // The runtime checks the owner grant for every command and interrupts active commands on revocation.

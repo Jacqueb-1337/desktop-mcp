@@ -103,7 +103,7 @@ impl PolicyFile {
             if !unique.insert((host.host_id.as_str(),host.workspace_id.as_str())) {
                 return Err("DUPLICATE_POLICY_SCOPE".into())
             }
-            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command")) {
+            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command")) {
                 return Err("UNSAFE_POLICY_TOOL".into())
             }
             if host.tools.iter().collect::<HashSet<_>>().len()!=host.tools.len() {

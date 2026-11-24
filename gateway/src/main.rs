@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap,VecDeque},
     fs,
     io::{self, BufReader, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
@@ -289,6 +289,7 @@ fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf,
         }
         println!("ROUTE_REQUIRES_LOCAL_APPROVAL {}",job.intent.request_id);
     }
+    let mut mux_pending=VecDeque::new();
     loop {
         let heartbeat = read_json(&mut tls)?;
         // An updated allowlist takes effect on the next heartbeat.
@@ -305,6 +306,12 @@ fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf,
                 info.connected_seconds=now.elapsed().as_secs();
             }
         }
+        if exec_enabled && heartbeat["route_mux_v1"]==true {
+            mux_heartbeat(&mut tls,requests.as_ref().ok_or("BROKER_REQUIRED")?,
+                &mut mux_pending,&allowlist_path,&id,broker.as_deref().ok_or("BROKER_REQUIRED")?)?;
+            continue;
+        }
+        if !mux_pending.is_empty() {return Err("MUX_CAPABILITY_LOST".into());}
         // Keep the heartbeat open briefly so a new request wakes the agent immediately.
         let job=requests.as_ref().and_then(|rx|rx.recv_timeout(Duration::from_secs(3)).ok());
         if let Some(job)=job {
@@ -330,6 +337,60 @@ fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf,
 
 fn host_allowed(path:&Path,host:&str,broker:Option<&broker::Broker>)->Result<bool,String> {
     Ok(load_allowlist(path)?.contains_key(host) || broker.and_then(|broker|broker.paired_key(host)).is_some())
+}
+
+// One authenticated connection carries bounded, request-bound routes. Each
+// heartbeat advances one route; a sleeping command cannot block new routes.
+fn mux_heartbeat(tls:&mut StreamOwned<ServerConnection,TcpStream>,
+    requests:&std::sync::mpsc::Receiver<broker::Job>, pending:&mut VecDeque<broker::Job>,
+    allowlist:&Path,host:&str,broker:&broker::Broker)->Result<(),String> {
+    use std::sync::atomic::Ordering;
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_|"CLOCK_INVALID")?.as_secs();
+    let inactive=|job:&broker::Job| job.canceled.load(Ordering::SeqCst) ||
+        job.frame["expires_at"].as_u64().is_none_or(|expires|now>=expires) ||
+        broker.policy_decision(&job.intent,host)!=policy::Decision::RequiresLocalApproval;
+    // Prioritize cancellation, then accept new work when below the cap.
+    let (job,op)=if let Some(pos)=pending.iter().position(inactive) {
+        (pending.remove(pos).unwrap(),"cancel")
+    } else {
+        let fresh=if pending.len()<4 {
+            requests.recv_timeout(if pending.is_empty(){Duration::from_secs(3)}else{Duration::from_millis(50)}).ok()
+        } else {None};
+        match fresh {
+            Some(job)=>(job,"start"),
+            None=>match pending.pop_front() {
+                Some(job)=>(job,"poll"),
+                None=>return send_json(tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}))
+            }
+        }
+    };
+    if !host_allowed(allowlist,host,Some(broker))? {return Err("HOST_REVOKED".into());}
+    if op=="start" {
+        if inactive(&job) {
+            let _=job.response.send(Err("ROUTE_CANCELED_EXPIRED_OR_REVOKED".into()));
+            return send_json(tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}));
+        }
+        if broker.audit.lock().map_err(|_|"AUDIT_LOCK_POISONED")?.reserve_bound(&job.intent,host,&job.frame).is_err() {
+            let _=job.response.send(Err("REQUEST_REPLAYED_OR_AUDIT_UNAVAILABLE".into()));
+            return send_json(tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}));
+        }
+    }
+    send_json(tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false,"mux":{"op":op,"frame":job.frame}}))?;
+    let response=read_json(tls)?;
+    let hash=broker::digest(&job.frame);
+    if op=="cancel" {
+        if response!=json!({"type":"route_cancelled","version":2,"request_hash":hash}) {return Err("MUX_CANCEL_MISMATCH".into());}
+        let _=job.response.send(Err("ROUTE_CANCELED_EXPIRED_OR_REVOKED".into()));
+    } else if response==json!({"type":"route_pending","version":2,"request_hash":hash}) {
+        pending.push_back(job);
+        if pending.len()>=4 {thread::sleep(Duration::from_millis(50));}
+    } else {
+        broker::verify_result(&response,&job.frame)?;
+        broker.audit.lock().map_err(|_|"AUDIT_LOCK_POISONED")?.record_completion(&job.intent,host)?;
+        let _=job.response.send(Ok(json!({"request_id":job.frame["request_id"],"host_id":host,
+            "workspace_id":"default","outcome":response["outcome"]})));
+    }
+    Ok(())
 }
 
 fn run_scoped_route(tls:&mut StreamOwned<ServerConnection,TcpStream>,job:&broker::Job,allowlist:&Path,host:&str,broker:&broker::Broker)->Result<Value,String> {

@@ -46,11 +46,16 @@ pub fn active(state:&Path,host_id:&str,tool:&str)->bool {
 }
 
 pub fn grant_id(state:&Path,host_id:&str)->Option<Uuid> {
+    grant_id_for(state,host_id,crate::elevation::COMMAND)
+}
+pub fn grant_id_for(state:&Path,host_id:&str,tool:&str)->Option<Uuid> {
+    let user=matches!(tool,crate::user_command::TOOL|crate::user_command::RESULT);
+    let (file,scope)=if user {("user-grant.json","unattended_user")}else{("grant.json","unattended_admin")};
     let root=machine_root().ok()?;
     let expected=root.join("State").canonicalize().ok()?;
     if state.canonicalize().ok()? != expected {return None;}
-    let value=read_record(&root.join("grant.json"))?;
-    if !valid_grant(&value,host_id,epoch()) {return None;}
+    let value=read_record(&root.join(file))?;
+    if !valid_scoped_grant(&value,host_id,epoch(),scope) {return None;}
     Uuid::parse_str(value["grant_id"].as_str()?).ok()
 }
 
@@ -78,6 +83,7 @@ pub(crate) fn write_record(path:&Path,value:&Value)->Result<(),String> {
 pub fn stage_request(state:&Path,frame:&Value)->Result<(),String> {
     write_record(&state.join("owner-request.json"),&json!({
         "request_id":frame["request_id"],"host_id":frame["target_host_id"],
+        "capability":frame["arguments"]["capability"],
         "expires_at":frame["expires_at"],"duration":frame["arguments"]["duration"]
     }))
 }
@@ -87,6 +93,11 @@ pub fn owner_decision(state:&Path,frame:&Value)->Option<bool> {
     if pending["request_id"]!=frame["request_id"] {return None;}
     let record=read_record(&state.join("owner-decision.json"))?;
     if record["request_id"]!=frame["request_id"] {return None;}
+    // A legacy supervisor must never approve the new user scope with its
+    // administrator-only prompt. Old admin decisions remain compatible.
+    if frame["arguments"]["capability"]==crate::user_command::TOOL &&
+        record["capability"]!=crate::user_command::TOOL {return None;}
+    if !record["capability"].is_null() && record["capability"]!=frame["arguments"]["capability"] {return None;}
     record["approved"].as_bool()
 }
 
@@ -101,19 +112,28 @@ pub fn issue_grant(state:&Path,frame:&Value)->Result<(),String> {
     }
     let duration=frame["arguments"]["duration"].as_str()
         .and_then(crate::route::permission_duration).ok_or("INVALID_PERMISSION_DURATION")?;
+    let (file,scope)=match frame["arguments"]["capability"].as_str() {
+        Some(crate::elevation::COMMAND)=>("grant.json","unattended_admin"),
+        Some(crate::user_command::TOOL)=>("user-grant.json","unattended_user"),
+        _=>return Err("INVALID_PERMISSION_SCOPE".into()),
+    };
     let grant=json!({
-        "version":1,"scope":"unattended_admin","host_id":frame["target_host_id"],
+        "version":1,"scope":scope,"host_id":frame["target_host_id"],
         "grant_id":Uuid::new_v4().to_string(),"issued_at":issued_at,
         "expires_at":duration.map(|seconds|issued_at+seconds),"revoked":false,
         "request_id":frame["request_id"]
     });
     audit_record(state,frame,&json!({"executed":false,"error":"owner_approved",
         "grant_id":grant["grant_id"]}))?;
-    write_record(&machine_root()?.join("grant.json"),&grant)
+    write_record(&machine_root()?.join(file),&grant)
 }
 
+#[cfg(test)]
 fn valid_grant(value:&Value,host_id:&str,now:u64)->bool{
-    if value["version"]!=1 || value["scope"]!="unattended_admin"
+    valid_scoped_grant(value,host_id,now,"unattended_admin")
+}
+fn valid_scoped_grant(value:&Value,host_id:&str,now:u64,scope:&str)->bool{
+    if value["version"]!=1 || value["scope"]!=scope
         || value["host_id"]!=host_id || value["revoked"]!=false {return false;}
     if value["grant_id"].as_str().is_none_or(|id|Uuid::parse_str(id).is_err()){return false;}
     let start=match value["issued_at"].as_u64(){Some(v)=>v,None=>return false};
@@ -125,7 +145,9 @@ fn valid_grant(value:&Value,host_id:&str,now:u64)->bool{
 pub fn audit(state:&Path,frame:&Value,outcome:&Value){
     let _=audit_record(state,frame,outcome);
 }
+static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn audit_record(state:&Path,frame:&Value,outcome:&Value)->Result<(),String>{
+    let _guard = AUDIT_LOCK.lock().map_err(|_|"AUDIT_LOCK_POISONED")?;
     use std::io::Write;
     use sha2::{Sha256,Digest};
     let path=state.join("unattended-audit.jsonl");
@@ -199,7 +221,12 @@ impl Drop for Task {
 }
 impl Task {
     pub fn start(frame:&Value,state:&Path,host:&str,grant:Uuid)->Result<Self,String>{
-        if grant_id(state,host)!=Some(grant){return Err("UNATTENDED_GRANT_INACTIVE".into());}
+        let tool=frame["tool"].as_str().ok_or("COMMAND_TOOL_REQUIRED")?;
+        if !matches!(tool,crate::elevation::COMMAND|crate::user_command::TOOL) {
+            return Err("COMMAND_TOOL_INVALID".into());
+        }
+        if grant_id_for(state,host,tool)!=Some(grant){return Err("UNATTENDED_GRANT_INACTIVE".into());}
+        let tool=tool.to_owned();
         let command=frame["arguments"]["command"].as_str().ok_or("COMMAND_REQUIRED")?;
         if !crate::elevation::valid_command(command){return Err("INVALID_ADMIN_COMMAND".into());}
         let expires=frame["expires_at"].as_u64().ok_or("INVALID_ROUTE_EXPIRY")?;
@@ -213,7 +240,7 @@ impl Task {
         let canceled=Arc::new(AtomicBool::new(false));
         let worker_canceled=canceled.clone();
         thread::Builder::new().name("desktop-mcp-system-command".into()).spawn(move ||{
-            let result=run(&command,&state,&host,expires,grant,&worker_canceled);
+            let result=run(&command,&state,&host,expires,grant,&worker_canceled,&tool);
             let mut record=result.clone();
             record["grant_id"]=json!(grant.to_string());
             audit(&state,&frame_copy,&record);
@@ -234,11 +261,19 @@ impl Task {
     }
 }
 
-fn run(command:&str,state:&Path,host:&str,expires:u64,grant:Uuid,canceled:&AtomicBool)->Value {
-    let authorized=|| !canceled.load(Ordering::Acquire) && grant_id(state,host)==Some(grant);
+fn run(command:&str,state:&Path,host:&str,expires:u64,grant:Uuid,canceled:&AtomicBool,tool:&str)->Value {
+    let authorized=|| !canceled.load(Ordering::Acquire) && grant_id_for(state,host,tool)==Some(grant);
     if !authorized(){return json!({"pending":false,"executed":false,"error":"GRANT_REVOKED"});}
     let now=epoch();
     if expires<=now || expires-now>120 {return json!({"pending":false,"executed":false,"error":"ROUTE_EXPIRED"});}
+    #[cfg(windows)]
+    if tool==crate::user_command::TOOL {
+        let deadline=Instant::now()+Duration::from_secs(expires.saturating_sub(now).min(100));
+        return match crate::user_command::run(command,state,||authorized() && epoch()<expires && Instant::now()<deadline) {
+            Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
+            Err(error)=>json!({"pending":false,"executed":false,"error":error}),
+        };
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -288,7 +323,7 @@ fn run(command:&str,state:&Path,host:&str,expires:u64,grant:Uuid,canceled:&Atomi
     {let _=(command,state,host,expires);json!({"pending":false,"executed":false,"error":"WINDOWS_ONLY"})}
 }
 
-fn capture(mut stream:impl Read)->(String, bool){
+pub(crate) fn capture(mut stream:impl Read)->(String, bool){
     let mut truncated = false;
     let mut output=Vec::new();
     let mut buf=[0u8;2048];
@@ -347,6 +382,16 @@ mod tests {
         let (out, truncated) = capture(&vec![b'a'; 6001][..]);
         assert_eq!(out.len(), 6000);
         assert!(truncated);
+    }
+    #[test]
+    fn user_and_admin_grant_scopes_are_distinct() {
+        let mut grant=json!({"version":1,"scope":"unattended_user","host_id":"hostA",
+            "grant_id":Uuid::new_v4().to_string(),"issued_at":1000,"expires_at":2000,"revoked":false});
+        assert!(valid_scoped_grant(&grant,"hostA",1500,"unattended_user"));
+        assert!(!valid_scoped_grant(&grant,"hostA",1500,"unattended_admin"));
+        grant["scope"]=json!("unattended_admin");
+        assert!(valid_scoped_grant(&grant,"hostA",1500,"unattended_admin"));
+        assert!(!valid_scoped_grant(&grant,"hostA",1500,"unattended_user"));
     }
     #[test]fn base64_is_correct(){
         assert_eq!(base64_encode(b""),"");

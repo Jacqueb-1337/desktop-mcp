@@ -9,6 +9,7 @@ mod route;
 mod readonly;
 mod windows_acl;
 mod unattended;
+mod user_command;
 mod terminal;
 mod approval;
 
@@ -80,6 +81,13 @@ fn process(request:&Value, agent:&mut Agent) -> Option<Value> {
 
 fn main() {
     let raw:Vec<_>=env::args_os().skip(1).collect();
+    #[cfg(windows)]
+    if raw.first().is_some_and(|v|v=="--user-command-worker") {
+        if raw.len()!=3 {std::process::exit(2);}
+        let result=raw[1].to_str().and_then(|s|s.parse::<u16>().ok()).zip(raw[2].to_str())
+            .ok_or("INVALID_WORKER_ARGUMENTS".to_string()).and_then(|(port,nonce)|user_command::worker(port,nonce));
+        std::process::exit(if result.is_ok(){0}else{1});
+    }
     if raw.first().is_some_and(|v|v=="--readonly-status-worker" || v=="--readonly-read-worker") {
         let read=raw[0]=="--readonly-read-worker";
         if raw.len()!=if read {4}else{3} || raw[1]!="--workspace" {std::process::exit(2);}

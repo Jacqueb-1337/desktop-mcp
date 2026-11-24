@@ -153,12 +153,24 @@ if route_enabled {
         send_json(&mut tls,&denied)?;
     }
     eprintln!("Authenticated TLS gateway presence: identity_only, remote_tools_enabled=false");
+    let mux_capable = cfg!(windows) && crate::unattended::verify_machine_identity_path(target.state_dir).is_ok();
+    let mut pending = MuxRoutes { state: target.state_dir, active: std::collections::HashMap::new() };
     loop {
-        send_json(&mut tls,&json!({"type":"heartbeat","version":1}))?;
+        let mut heartbeat=json!({"type":"heartbeat","version":1});
+        if mux_capable { heartbeat["route_mux_v1"]=json!(true); }
+        send_json(&mut tls,&heartbeat)?;
         let ack=recv_json(&mut tls)?;
         if ack.get("type").and_then(Value::as_str)!=Some("heartbeat_ack")
             || ack.get("remote_tools_enabled")!=Some(&Value::Bool(false)) {
             return Err("GATEWAY_HEARTBEAT_REJECTED".into());
+        }
+        if let Some(mux)=ack.get("mux") {
+            if !exec_enabled || !mux_capable || ack.get("route").is_some() {
+                return Err("MUX_NOT_NEGOTIATED".into());
+            }
+            let outcome=pending.handle(mux,auth["host_id"].as_str().ok_or("HOST_REQUIRED")?)?;
+            send_json(&mut tls,&outcome)?;
+            continue;
         }
         if let Some(frame)=ack.get("route") {
             if !exec_enabled {return Err("EXECUTABLE_ROUTE_NOT_NEGOTIATED".into());}
@@ -179,8 +191,68 @@ if route_enabled {
                 "route_denial_sent":route_enabled
             }));
         }
-        if ack.get("route").is_none() {
+        if ack.get("route").is_none() && pending.active.is_empty() {
             thread::sleep(Duration::from_secs(4));
+        }
+    }
+}
+
+struct MuxRoutes<'a> {
+    state: &'a Path,
+    active: std::collections::HashMap<String,Value>,
+}
+impl Drop for MuxRoutes<'_> {
+    fn drop(&mut self) {
+        for frame in self.active.values() {
+            let _=service::request(self.state,"approval_cancel",json!({"route":frame}));
+        }
+    }
+}
+impl MuxRoutes<'_> {
+    fn handle(&mut self,mux:&Value,host:&str)->Result<Value,String> {
+        let frame=&mux["frame"];
+        route::deny(frame,host)?;
+        if frame["version"]!=2 || !mux.as_object().is_some_and(|x|x.len()==2) {
+            return Err("MUX_ROUTE_INVALID".into());
+        }
+        let hash=hex::encode(sha2::Sha256::digest(serde_json::to_vec(frame).map_err(|_|"ROUTE_ENCODE")?));
+        let finish=|outcome:Value|json!({"type":"route_result","version":2,"request_id":frame["request_id"],
+            "target_host_id":host,"nonce":frame["nonce"],"request_hash":hash,"outcome":outcome});
+        match mux["op"].as_str() {
+            Some("start") => {
+                if self.active.contains_key(&hash) || self.active.len()>=4 {
+                    return Err("MUX_CAPACITY_OR_REPLAY".into());
+                }
+                let staged=service::request(self.state,"approval_stage",json!({"route":frame}));
+                if !staged.as_ref().is_ok_and(|reply|reply["queued"]==true) {
+                    let reason=match staged.as_ref().err().map(String::as_str) {
+                        Some(reason @ ("LOCAL_PERMISSION_REQUIRED"|"PERMISSION_REQUESTS_DISABLED"|"REMOTE_READONLY_DISABLED"|
+                            "ADMIN_HELPER_UNAVAILABLE"|"SYSTEM_COMMAND_BUSY"|"SYSTEM_PERMISSION_BUSY"))=>reason,
+                        _=>"LOCAL_APPROVAL_UNAVAILABLE",
+                    };
+                    let _=service::request(self.state,"approval_cancel",json!({"route":frame}));
+                    return Ok(finish(json!({"pending":false,"executed":false,"error":reason})));
+                }
+                self.active.insert(hash.clone(),frame.clone());
+            },
+            Some("poll"|"cancel") => {
+                if self.active.get(&hash)!=Some(frame) {return Err("MUX_UNKNOWN_ROUTE".into());}
+                if mux["op"]=="cancel" {
+                    service::request(self.state,"approval_cancel",json!({"route":frame}))?;
+                    self.active.remove(&hash);
+                    return Ok(json!({"type":"route_cancelled","version":2,"request_hash":hash}));
+                }
+            },
+            _=>return Err("MUX_OPERATION_INVALID".into())
+        }
+        let outcome=service::request(self.state,"approval_execute",json!({"route":frame}))
+            .unwrap_or_else(|_|json!({"pending":false,"executed":false,"error":"LOCAL_AGENT_UNAVAILABLE"}));
+        if outcome["pending"]==true {
+            Ok(json!({"type":"route_pending","version":2,"request_hash":hash}))
+        } else {
+            let _=service::request(self.state,"approval_cancel",json!({"route":frame}));
+            self.active.remove(&hash);
+            Ok(finish(outcome))
         }
     }
 }
