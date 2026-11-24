@@ -305,11 +305,16 @@ fn handle(stream: TcpStream, config: Arc<ServerConfig>, allowlist_path: PathBuf,
                 info.connected_seconds=now.elapsed().as_secs();
             }
         }
-        let job=requests.as_ref().and_then(|rx|rx.try_recv().ok());
+        // Keep the heartbeat open briefly so a new request wakes the agent immediately.
+        let job=requests.as_ref().and_then(|rx|rx.recv_timeout(Duration::from_secs(3)).ok());
         if let Some(job)=job {
             let broker=broker.as_ref().ok_or("BROKER_REQUIRED")?;
             if job.canceled.load(std::sync::atomic::Ordering::SeqCst) {send_json(&mut tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}))?;continue;}
             if broker.policy_decision(&job.intent,&id)!=policy::Decision::RequiresLocalApproval {let _=job.response.send(Err("POLICY_DENIED".into()));send_json(&mut tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}))?;continue;}
+            if !host_allowed(&allowlist_path,&id,Some(broker))? {
+                let _=job.response.send(Err("HOST_REVOKED".into()));
+                return Err("HOST_REVOKED".into());
+            }
             let reserved=broker.audit.lock().map_err(|_|"AUDIT_LOCK_POISONED")?.reserve_bound(&job.intent,&id,&job.frame);
             if reserved.is_err(){let _=job.response.send(Err("REQUEST_REPLAYED_OR_AUDIT_UNAVAILABLE".into()));send_json(&mut tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false}))?;continue;}
             send_json(&mut tls,&json!({"type":"heartbeat_ack","remote_tools_enabled":false,"route":job.frame}))?;
