@@ -4,6 +4,8 @@
 Run under a dedicated account that can read only the upstream bearer and CA, not
 under the gateway account or root. This adapter opens no listening socket.
 """
+from concurrent.futures import ThreadPoolExecutor
+from threading import BoundedSemaphore, Lock
 import argparse
 import http.client
 import json
@@ -39,9 +41,42 @@ def read_token(path):
     return token
 
 
+OUTPUT_LOCK = Lock()
+
+
 def emit(result):
-    sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    with OUTPUT_LOCK:
+        sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+
+def forward(port, context, line, headers, method, request_id):
+    connection = http.client.HTTPSConnection("127.0.0.1", port, timeout=112, context=context)
+    try:
+        connection.request("POST", "/mcp", line, headers)
+        response = connection.getresponse()
+        data = response.read(RESULT_LIMIT + 1)
+        if request_id is None:
+            return  # Notifications never receive a JSON-RPC response.
+        if len(data) > RESULT_LIMIT or not data:
+            emit(error("Private gateway rejected the request", request_id))
+            return
+        result = json.loads(data)
+        if not isinstance(result, dict) or result.get("id") != request_id or result.get("jsonrpc") != "2.0":
+            emit(error("Invalid gateway response", request_id))
+            return
+        negotiated = None
+        if method == "initialize":
+            protocol = result.get("result", {}).get("protocolVersion")
+            if protocol in LEGACY:
+                negotiated = protocol
+        emit(result)
+        return negotiated
+    except (OSError, ValueError, http.client.HTTPException):
+        if request_id is not None:
+            emit(error("Private gateway unavailable", request_id))
+    finally:
+        connection.close()
 
 
 def main():
@@ -58,6 +93,8 @@ def main():
         return 2
     if not 1 <= args.port <= 65535:
         parser.error("invalid upstream port")
+    pool = ThreadPoolExecutor(max_workers=4)
+    slots = BoundedSemaphore(12)
     legacy = None
     while line := sys.stdin.buffer.readline(LIMIT + 1):
         if len(line) > LIMIT:
@@ -96,30 +133,17 @@ def main():
         except (ValueError, KeyError, UnicodeError):
             emit(error("Invalid MCP request", code=-32600))
             continue
-        connection = http.client.HTTPSConnection("127.0.0.1", args.port, timeout=112, context=context)
-        try:
-            connection.request("POST", "/mcp", line, headers)
-            response = connection.getresponse()
-            data = response.read(RESULT_LIMIT + 1)
-            if request_id is None:
-                continue  # Notifications never receive a JSON-RPC response.
-            if len(data) > RESULT_LIMIT or not data:
-                emit(error("Private gateway rejected the request", request_id))
+        if method == "tools/call" and request_id is not None:
+            if not slots.acquire(blocking=False):
+                emit(error("Bridge busy; retry this request", request_id, -32000))
                 continue
-            result = json.loads(data)
-            if not isinstance(result, dict) or result.get("id") != request_id or result.get("jsonrpc") != "2.0":
-                emit(error("Invalid gateway response", request_id))
-                continue
-            if method == "initialize":
-                protocol = result.get("result", {}).get("protocolVersion")
-                if protocol in LEGACY:
-                    legacy = protocol
-            emit(result)
-        except (OSError, ValueError, http.client.HTTPException):
-            if request_id is not None:
-                emit(error("Private gateway unavailable", request_id))
-        finally:
-            connection.close()
+            pending = pool.submit(forward, args.port, context, line, headers, method, request_id)
+            pending.add_done_callback(lambda _: slots.release())
+        else:
+            negotiated = forward(args.port, context, line, headers, method, request_id)
+            if negotiated:
+                legacy = negotiated
+    pool.shutdown(wait=True)
     return 0
 
 
