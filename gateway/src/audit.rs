@@ -136,9 +136,19 @@ impl Drop for DirGuard {
     }
 }
 
+// Explicitly release the OS lock before the in-process directory guard.
+// On Unix a concurrently spawned child may temporarily inherit the open
+// file description, so closing our descriptor alone is not sufficient.
+struct AuditLock(File);
+impl Drop for AuditLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 pub struct Audit {
+    _lock: AuditLock,
     _guard: DirGuard,
-    _lock: File,
     key: [u8; 32],
     file: File,
     sequence: u64,
@@ -164,6 +174,7 @@ impl Audit {
                 return Err("AUDIT_UNSAFE_DIRECTORY_PERMISSIONS".into());
             }
         }
+        let guard=DirGuard::acquire(dir)?;
         let lock_path = dir.join(LOCK_FILE);
         validate_file(&lock_path)?;
         let mut lock_options=OpenOptions::new();
@@ -176,7 +187,7 @@ impl Audit {
         let lock=lock_options.open(&lock_path)
             .map_err(|e|format!("AUDIT_LOCK_OPEN: {e}"))?;
         lock.try_lock().map_err(|_| "AUDIT_LOCK_BUSY".to_string())?;
-        let guard=DirGuard::acquire(dir)?;
+        let lock=AuditLock(lock);
         let key_path = dir.join(KEY_FILE);
         let log_path = dir.join(LOG_FILE);
         let key_size = validate_file(&key_path)?;
@@ -408,6 +419,25 @@ mod tests {
         assert!(Audit::open(temp.path()).is_err());
         drop(first);
         assert!(Audit::open(temp.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_released_even_when_descriptor_is_inherited() {
+        let temp=private_temp();
+        let first=Audit::open(temp.path()).unwrap();
+        // dup shares the same open file description as a forked child.
+        let inherited=first._lock.0.try_clone().unwrap();
+        let independent=OpenOptions::new().read(true).write(true)
+            .open(temp.path().join(LOCK_FILE)).unwrap();
+        assert!(independent.try_lock().is_err());
+        drop(first);
+        let second=Audit::open(temp.path()).unwrap();
+        assert!(independent.try_lock().is_err());
+        drop(second);
+        independent.try_lock().unwrap();
+        independent.unlock().unwrap();
+        drop(inherited);
     }
 
     #[test]
