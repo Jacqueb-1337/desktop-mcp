@@ -46,3 +46,7 @@ migration, automatic rollback on service failure, or live connectivity.
 Run only in a disposable Linux test environment with dpkg and a static C toolchain:
 
     sudo bash docs/test-gateway-package-lifecycle.sh
+
+## Release automation
+
+The Linux gateway release packages workflow builds and tests native amd64 and arm64 static binaries on GitHub-hosted Linux runners. A manual workflow run produces downloadable CI artifacts without publishing. A version-tag run verifies both architectures and attaches their versioned Debian packages and individual SHA-256 files to the existing GitHub release. Create the release as a draft before pushing the matching version tag, or manually attach the verified workflow artifacts before publishing. The workflow does not install or restart the NAS gateway. Windows installer/tray assets remain a separate build step; keep both platforms on the same source revision and version.
