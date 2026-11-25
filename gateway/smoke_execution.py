@@ -112,7 +112,14 @@ def main(agent,gateway,permissions=False):
                         assert result["isError"] is True, result
 
                 assert local_call(state,"set_admin_command",duration="permanent")["error"] == "ADMIN_HELPER_UNAVAILABLE"
-                assert call(tool="admin_command",command="Write-Output 'disposable test'")["structuredContent"]["outcome"]["error"] == "ADMIN_HELPER_UNAVAILABLE"
+                start = call(tool="admin_command",command="Write-Output 'disposable test'")
+                assert start["structuredContent"]["outcome"]["pending"] is True, start
+                run_id=start["structuredContent"]["request_id"]
+                for _ in range(100):
+                    result=call(tool="admin_command_result",run_id=run_id)
+                    if result.get("structuredContent",{}).get("outcome",{}).get("pending") is not True: break
+                    time.sleep(.1)
+                assert result["structuredContent"]["outcome"]["error"] == "ADMIN_HELPER_UNAVAILABLE", result
                 assert call(tool="request_permission", capability="admin_command", duration="7m")["structuredContent"]["outcome"]["error"] == "ADMIN_HELPER_UNAVAILABLE"
                 assert call(tool="system_volume_status")["structuredContent"]["outcome"]["error"] == "ADMIN_HELPER_UNAVAILABLE"
                 assert call(tool="request_permission", capability="system_volume_status", duration="permanent")["structuredContent"]["outcome"]["error"] == "ADMIN_HELPER_UNAVAILABLE"
