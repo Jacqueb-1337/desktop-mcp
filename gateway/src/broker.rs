@@ -146,7 +146,8 @@ impl Broker {
         Ok(())
     }
     fn pair_device(&self,code:&str,nickname:Option<&str>)->Result<Value,String> {
-        let (host,key)=setup_key(code).ok_or("INVALID_DEVICE_CODE")?;
+        let (identity,wireguard)=crate::enrollment::split_code(code).ok_or("INVALID_DEVICE_CODE")?;
+        let (host,key)=setup_key(identity).ok_or("INVALID_DEVICE_CODE")?;
         let mut paired=self.paired.lock().map_err(|_|"PAIRING_STORE_UNAVAILABLE")?;
         let new=!paired.keys.contains_key(&host) && !self.policy.hosts.iter().any(|scope|scope.host_id==host);
         if new || nickname.is_some() {
@@ -159,8 +160,16 @@ impl Broker {
             self.save_devices(&next)?;
             *paired=next;
         }
+        // The signing identity must be persisted before admitting the tunnel.
+        // On enrollment failure the caller can retry the same combined code.
+        // Never report that WireGuard succeeded unless the privileged helper confirmed it.
+        let name=paired.nicknames.get(&host).cloned();
+        drop(paired);
+        if let Some(peer)=wireguard {
+            crate::enrollment::enroll(identity,peer,&host)?;
+        }
         Ok(json!({"host_id":host,"workspace_id":"default","paired":true,
-            "nickname":paired.nicknames.get(&host),"elevated_access_requires_owner_approval":true}))
+            "nickname":name,"wireguard_enrolled":wireguard.is_some(),"elevated_access_requires_owner_approval":true}))
     }
     fn rename_device(&self,host:&str,nickname:&str)->Result<Value,String> {
         let mut paired=self.paired.lock().map_err(|_|"PAIRING_STORE_UNAVAILABLE")?;

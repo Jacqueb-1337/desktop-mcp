@@ -45,7 +45,7 @@ internal static class OfficialWireGuardInstaller
         {
             string msiexec=Path.Combine(Environment.SystemDirectory,"msiexec.exe");
             var start=new ProcessStartInfo(msiexec,
-                "/i \"" + path.Replace("\"","") + "\" /qn /norestart"){
+                "/i \"" + path.Replace("\"","") + "\" /qn /norestart DO_NOT_LAUNCH=1"){
                 UseShellExecute=false,CreateNoWindow=true
             };
             using(var process=Process.Start(start))

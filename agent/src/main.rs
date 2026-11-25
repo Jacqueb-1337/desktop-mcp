@@ -81,8 +81,23 @@ fn process(request:&Value, agent:&mut Agent) -> Option<Value> {
     }
 }
 
+// Task Scheduler starts console-subsystem executables with a dedicated
+// console. Release that console only for the two long-running background
+// modes, and only if no other process shares it. Keep CLI and piped I/O.
+#[cfg(windows)]
+fn release_background_console(args:&[std::ffi::OsString]) {
+    use windows_sys::Win32::System::Console::{FreeConsole,GetConsoleProcessList};
+    if !args.first().is_some_and(|v|v=="--serve-local" || v=="--gateway-connect") {return;}
+    let mut pids=[0u32;2];
+    if unsafe{GetConsoleProcessList(pids.as_mut_ptr(),pids.len() as u32)}==1
+        && pids[0]==std::process::id() {
+        unsafe{FreeConsole();}
+    }
+}
 fn main() {
     let raw:Vec<_>=env::args_os().skip(1).collect();
+    #[cfg(windows)]
+    release_background_console(&raw);
     #[cfg(windows)]
     if raw.first().is_some_and(|v|v=="--user-command-worker" || v=="--user-terminal-worker" || v=="--user-repository-worker") {
         if raw.len()!=3 {std::process::exit(2);}
@@ -162,7 +177,7 @@ fn main() {
             "--gateway-tls-name" => gateway_tls_name=args.next(),
             "--gateway-ca" => gateway_ca=args.next().map(PathBuf::from),
             "--version" => {
-                eprintln!("desktop-mcp-agent 0.1.0");
+                println!("desktop-mcp-agent {}",env!("CARGO_PKG_VERSION"));
                 return;
             }
             _ => {

@@ -46,6 +46,11 @@ try {
     catch {
         if($_.Exception.GetBaseException().Message -notmatch 'fresh installation'){throw}
     }
+    $fixtureAgent=@(Get-Process desktop-mcp-agent -ErrorAction Stop | Where-Object { $_.Path -eq "$app\desktop-mcp-agent.exe" })
+    if($fixtureAgent.Count -ne 1 -or $fixtureAgent[0].MainWindowHandle -ne [IntPtr]::Zero){
+        throw 'Scheduled background agent has a visible console'
+    }
+    Write-Output 'PASS: background agent running without a console window.'
     Write-Output 'PASS: fresh local installer, tasks, pairing identity, public gateway persistence, safe no-overwrite.'
     if($UpgradeInstaller) {
         $beforePair = (Get-Content "$state\pairing-identity.json" -Raw | ConvertFrom-Json).private_key

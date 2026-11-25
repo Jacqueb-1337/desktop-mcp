@@ -4,6 +4,7 @@ mod route;
 mod audit;
 mod mcp;
 mod broker;
+mod enrollment;
 mod windows_acl;
 // Identity-only TLS gateway. This intentionally has NO MCP tool execution,
 // file access, arbitrary command routing or ChatGPT-facing endpoint.

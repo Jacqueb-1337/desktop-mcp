@@ -1,0 +1,21 @@
+[Unit]
+Description=Desktop MCP validated peer enrollment
+After=wg-quick@wgdmcp.service
+Requires=wg-quick@wgdmcp.service
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/desktop-mcp-enrollment-helper.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=12
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/wireguard
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_OVERRIDE
+UMask=0077

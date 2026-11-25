@@ -37,15 +37,24 @@ public installer. There is no internet-facing MCP TCP port.
   derived from the 32-byte DM1 signing public key. It also persists a peer section
   in `/etc/wireguard/wgdmcp.conf`, and allows revocation without restarting
   the server.
-- Parse the `DMW1` code into its `DM1-<64hex>` identity and
-  `<44-character-WireGuard-public-key>` fields.
-- First authorize the `DM1` device through the private Desktop MCP
-  `pair_device` tool. Then, after verifying the device owner, run as NAS root:
-
-  ```
-  desktop-mcp-register-peer enroll '<DM1-code>' '<WireGuard-public-key>'
-  ```
-
+- Starting with v0.3.6, send the complete DMW1 registration code to the authenticated
+  `pair_device` tool. It validates the signing identity, saves the pairing, and calls
+  the optional local enrollment socket to register the WireGuard public key.
+  The tool reports success only after the live WireGuard peer is confirmed.
+  If the helper is unavailable, the signing identity remains paired; retry the
+  same combined code after fixing the helper. Legacy DM1 codes still work.
+- On a NAS that uses the existing root-owned `desktop-mcp-register-peer` utility,
+  install the three files under `docs/nas-enrollment/` explicitly as administrator.
+  Copy the Python helper to `/usr/local/libexec/desktop-mcp-enrollment-helper.py`
+  (root:root, mode 0755) and the socket and service units to `/etc/systemd/system/`
+  (root:root, mode 0644), then run `systemctl daemon-reload` and
+  `systemctl enable --now desktop-mcp-enrollment.socket`.
+  The socket is accessible only to the designated gateway account; the root helper
+  verifies the connecting UID and validates the exact request. It cannot run
+  arbitrary commands or grant Windows permissions. The Debian gateway package
+  does not modify this administrator-managed configuration.
+- Without the helper, the NAS administrator can still use the old separate
+  DM1 pairing and `desktop-mcp-register-peer enroll '<DM1-code>' '<WireGuard-public-key>'` workflow.
 - To revoke tunnel entry:
 
   ```
