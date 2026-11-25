@@ -51,8 +51,10 @@ public installer. There is no internet-facing MCP TCP port.
   `systemctl enable --now desktop-mcp-enrollment.socket`.
   The socket is accessible only to the designated gateway account; the root helper
   verifies the connecting UID and validates the exact request. It cannot run
-  arbitrary commands or grant Windows permissions. The Debian gateway package
-  does not modify this administrator-managed configuration.
+  arbitrary commands or grant Windows permissions. The updated Debian packaging
+  includes the helper and systemd units, with conditional activation on a
+  configured gateway. Existing administrator-managed units are preserved.
+  The manual source installation above remains available.
 - Without the helper, the NAS administrator can still use the old separate
   DM1 pairing and `desktop-mcp-register-peer enroll '<DM1-code>' '<WireGuard-public-key>'` workflow.
 - To revoke tunnel entry:

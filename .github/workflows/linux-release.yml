@@ -1,6 +1,12 @@
 name: Linux gateway release packages
 on:
   workflow_dispatch:
+    inputs:
+      debian_revision:
+        description: 'Optional positive Debian packaging revision for manual builds'
+        required: false
+        type: string
+        default: ''
   push:
     tags:
       - 'v*'
@@ -37,16 +43,23 @@ jobs:
           sudo bash docs/test-gateway-package-lifecycle.sh
       - name: Package and verify actual binary
         shell: bash
+        env:
+          DEBIAN_REVISION: ${{ inputs.debian_revision }}
         run: |
           set -euo pipefail
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("gateway/Cargo.toml","rb"))["package"]["version"])')
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
             [[ "$GITHUB_REF_NAME" == "v$version" ]]
           fi
+          package_version="$version"
+          if [[ -n "$DEBIAN_REVISION" ]]; then
+            [[ "$GITHUB_REF_TYPE" != tag && "$DEBIAN_REVISION" =~ ^[1-9][0-9]*$ ]]
+            package_version="$version-$DEBIAN_REVISION"
+          fi
           bin="gateway/target/${{ matrix.target }}/release/desktop-mcp-gateway"
-          bash docs/build-gateway-deb.sh "$bin" "$version" "${{ matrix.arch }}" dist
-          package="dist/desktop-mcp-gateway_${version}_${{ matrix.arch }}.deb"
-          [[ "$(dpkg-deb -f "$package" Version)" == "$version" ]]
+          bash docs/build-gateway-deb.sh "$bin" "$package_version" "${{ matrix.arch }}" dist
+          package="dist/desktop-mcp-gateway_${package_version}_${{ matrix.arch }}.deb"
+          [[ "$(dpkg-deb -f "$package" Version)" == "$package_version" ]]
           [[ "$(dpkg-deb -f "$package" Architecture)" == "${{ matrix.arch }}" ]]
           tmp=$(mktemp -d)
           trap 'rm -rf -- "$tmp"' EXIT

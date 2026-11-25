@@ -26,6 +26,8 @@ printf '[Service]\nExecStart=/opt/legacy-fixture/executable\n' > "$root/etc/syst
 snapshot() {
     (cd "$root"; find etc var/lib/fixture opt/legacy-fixture -type f -print0 | sort -z | xargs -0 sha256sum; find etc var/lib/fixture opt/legacy-fixture -type f -printf '%m %U %G %p\n' | sort)
 }
+printf '[Socket]\nListenStream=/run/fixture-enrollment.sock\n' > "$root/etc/systemd/system/desktop-mcp-enrollment.socket"
+printf '[Service]\nExecStart=/opt/legacy-fixture/executable\n' > "$root/etc/systemd/system/desktop-mcp-enrollment@.service"
 snapshot > "$work/before"
 check_state() {
     snapshot > "$work/after"
@@ -33,10 +35,16 @@ check_state() {
 }
 install_version() {
     local version=$1
-    dpkg --root="$root" --install "$work/out/desktop-mcp-gateway_0.0.${version}_${arch}.deb"
+    dpkg --force-script-chrootless --root="$root" --install "$work/out/desktop-mcp-gateway_0.0.${version}_${arch}.deb"
     [[ $(dpkg-query --admindir="$admin" -W -f='${Version}' desktop-mcp-gateway) == "0.0.$version" ]]
     [[ $("$root/usr/lib/desktop-mcp/desktop-mcp-gateway") == "fixture-$version" ]]
     cmp "$work/fixture-$version" "$root/usr/lib/desktop-mcp/desktop-mcp-gateway"
+    cmp "$repo/docs/nas-enrollment/enrollment-helper.py" "$root/usr/lib/desktop-mcp/enrollment-helper.py"
+    cmp "$repo/docs/nas-enrollment/enable-enrollment.sh" "$root/usr/lib/desktop-mcp/enable-enrollment"
+    cmp "$repo/docs/nas-enrollment/desktop-mcp-enrollment.socket" "$root/usr/lib/systemd/system/desktop-mcp-enrollment.socket"
+    grep -Fx 'ExecStart=/usr/bin/python3 -I /usr/lib/desktop-mcp/enrollment-helper.py' "$root/usr/lib/systemd/system/desktop-mcp-enrollment@.service"
+    [[ $(stat -c %a "$root/usr/lib/desktop-mcp/enrollment-helper.py") == 755 ]]
+    [[ $(stat -c %a "$root/usr/lib/systemd/system/desktop-mcp-enrollment.socket") == 644 ]]
     check_state
 }
 install_version 1
@@ -44,11 +52,15 @@ install_version 2
 install_version 2
 install_version 1
 # Test package removal and purge against only the isolated root.
-dpkg --root="$root" --remove desktop-mcp-gateway
+dpkg --force-script-chrootless --root="$root" --remove desktop-mcp-gateway
 [[ ! -e "$root/usr/lib/desktop-mcp/desktop-mcp-gateway" ]]
+[[ ! -e "$root/usr/lib/desktop-mcp/enrollment-helper.py" ]]
+[[ ! -e "$root/usr/lib/systemd/system/desktop-mcp-enrollment.socket" ]]
 check_state
 install_version 2
-dpkg --root="$root" --purge desktop-mcp-gateway
+dpkg --force-script-chrootless --root="$root" --purge desktop-mcp-gateway
 [[ ! -e "$root/usr/lib/desktop-mcp/desktop-mcp-gateway" ]]
+[[ ! -e "$root/usr/lib/desktop-mcp/enrollment-helper.py" ]]
+[[ ! -e "$root/usr/lib/systemd/system/desktop-mcp-enrollment.socket" ]]
 check_state
 echo 'Isolated package lifecycle tests passed: fresh install, upgrade, reinstall, downgrade, remove, purge, preserved fixture state.'

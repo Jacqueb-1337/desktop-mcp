@@ -19,8 +19,12 @@ package="$work/out/desktop-mcp-gateway_0.0.0_${arch}.deb"
 [[ "$(dpkg-deb -f "$package" Version)" == 0.0.0 ]]
 dpkg-deb -e "$package" "$work/control"
 dpkg-deb -x "$package" "$work/extracted"
-[[ "$(find "$work/control" -maxdepth 1 -type f | wc -l)" == 2 ]]
+[[ "$(find "$work/control" -maxdepth 1 -type f | wc -l)" == 4 ]]
 [[ -f "$work/control/control" && -f "$work/control/md5sums" ]]
+for hook in postinst prerm; do
+    [[ -x "$work/control/$hook" ]]
+    cmp "$repo/docs/nas-enrollment/package-$hook.sh" "$work/control/$hook"
+done
 [[ "$(stat -c %a "$work/extracted")" == 755 ]]
 cmp "$work/fixture" "$work/extracted/usr/lib/desktop-mcp/desktop-mcp-gateway"
 (cd "$work/extracted" && md5sum -c "$work/control/md5sums")

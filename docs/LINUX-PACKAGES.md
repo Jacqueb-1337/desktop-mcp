@@ -1,10 +1,15 @@
 # Linux gateway packages
 
-The Debian package is a binary-only distribution artifact. It does not contain
-credentials, authorization policies, network settings, service units, or
-maintainer scripts. Installing it does not start or restart a service or change
-an existing deployment. The administrator must manage service configuration
-independently. Existing custom gateway locations are not replaced by this package.
+The Debian package contains the static gateway binary, enrollment helper,
+systemd socket/template units and conditional package hooks. It contains no
+credentials, authorization policies or network settings. It does not restart
+the gateway or replace custom gateway locations or local unit overrides.
+
+Enrollment activation requires an already configured gateway. If prerequisites
+are missing, the installer reports why activation was skipped. An administrator
+can retry after completing gateway setup using the packaged enable-enrollment
+utility at `/usr/lib/desktop-mcp/enable-enrollment`. Package installation does not enroll
+individual peers or grant remote permissions.
 
 ## Build environment
 
@@ -49,4 +54,4 @@ Run only in a disposable Linux test environment with dpkg and a static C toolcha
 
 ## Release automation
 
-The Linux gateway release packages workflow builds and tests native amd64 and arm64 static binaries on GitHub-hosted Linux runners. A manual workflow run produces downloadable CI artifacts without publishing. A version-tag run verifies both architectures and attaches their versioned Debian packages and individual SHA-256 files to the existing GitHub release. Create the release as a draft before pushing the matching version tag, or manually attach the verified workflow artifacts before publishing. The workflow does not install or restart the NAS gateway. Windows installer/tray assets remain a separate build step; keep both platforms on the same source revision and version.
+The Linux gateway release packages workflow builds and tests native amd64 and arm64 static binaries on GitHub-hosted Linux runners. A manual workflow run produces downloadable CI artifacts without publishing. For packaging-only fixes, set the optional `debian_revision` input to a positive integer (for example `1` produces `0.3.6-1` packages from the v0.3.6 gateway binary). This lets dpkg distinguish packaging updates without changing the executable's version. A version-tag run verifies both architectures and attaches their versioned Debian packages and individual SHA-256 files to the existing GitHub release. Create the release as a draft before pushing the matching version tag, or manually attach the verified workflow artifacts before publishing. The workflow does not install or restart the NAS gateway. Windows installer/tray assets remain a separate build step; keep both platforms on the same source revision and version.

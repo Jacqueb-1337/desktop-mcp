@@ -27,6 +27,15 @@ chmod 0755 "$root"
 install -d -m 0755 "$root/DEBIAN" "$root/usr/lib/desktop-mcp" "$root/usr/share/doc/desktop-mcp-gateway"
 install -m 0755 "$binary" "$root/usr/lib/desktop-mcp/desktop-mcp-gateway"
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+install -d -m 0755 "$root/usr/lib/systemd/system"
+install -m 0755 "$repo/docs/nas-enrollment/enrollment-helper.py" "$root/usr/lib/desktop-mcp/enrollment-helper.py"
+install -m 0755 "$repo/docs/nas-enrollment/enable-enrollment.sh" "$root/usr/lib/desktop-mcp/enable-enrollment"
+install -m 0644 "$repo/docs/nas-enrollment/desktop-mcp-enrollment.socket" "$root/usr/lib/systemd/system/"
+sed 's|/usr/local/libexec/desktop-mcp-enrollment-helper.py|/usr/lib/desktop-mcp/enrollment-helper.py|' \
+    "$repo/docs/nas-enrollment/desktop-mcp-enrollment@.service" > "$root/usr/lib/systemd/system/desktop-mcp-enrollment@.service"
+chmod 0644 "$root/usr/lib/systemd/system/desktop-mcp-enrollment@.service"
+install -m 0755 "$repo/docs/nas-enrollment/package-postinst.sh" "$root/DEBIAN/postinst"
+install -m 0755 "$repo/docs/nas-enrollment/package-prerm.sh" "$root/DEBIAN/prerm"
 install -m 0644 "$repo/LICENSE" "$root/usr/share/doc/desktop-mcp-gateway/copyright"
 size=$(du -sk "$root/usr" | cut -f1)
 cat > "$root/DEBIAN/control" <<EOF
@@ -37,9 +46,11 @@ Maintainer: Desktop MCP maintainers
 Section: net
 Priority: optional
 Installed-Size: $size
-Description: Desktop MCP Linux gateway executable
- Static gateway binary for an independently configured Desktop MCP service.
- This package does not create, activate, or modify authorization or service state.
+Recommends: python3, wireguard-tools, systemd
+Description: Desktop MCP Linux gateway and enrollment helper
+ Static gateway binary and local enrollment helper for an independently
+ configured Desktop MCP service. The helper activates only on a configured
+ WireGuard gateway; existing authorization and network settings are preserved.
 EOF
 chmod 0644 "$root/DEBIAN/control"
 (cd "$root" && find usr -type f -print0 | sort -z | xargs -0 md5sum > DEBIAN/md5sums)
