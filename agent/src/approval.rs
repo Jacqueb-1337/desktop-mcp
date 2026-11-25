@@ -73,6 +73,11 @@ fn epoch_seconds() -> Result<u64, String> {
         .map_err(|_| "INVALID_SYSTEM_CLOCK".into())
 }
 
+fn valid_scope(frame:&Value,scope:Option<&str>)->bool {
+    if frame["tool"]=="request_permission"{return scope.is_some_and(|s|!s.is_empty());}
+    scope.is_none() || (frame["version"]==2 && frame["tool"].as_str().is_some_and(route::repository_tool)
+        && scope.is_some_and(|s|!s.is_empty()))
+}
 fn fingerprint(frame: &Value) -> Result<String, String> {
     let encoded = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
     Ok(hex::encode(Sha256::digest(&encoded)))
@@ -162,7 +167,7 @@ impl Inbox {
         match event {
             Event::Stage { version: 1, created, frame, digest, scope } => {
                 route::deny(&frame, &self.host_id)?;
-                if (frame["tool"] == "request_permission") != scope.as_ref().is_some_and(|path| !path.is_empty()) {
+                if !valid_scope(&frame,scope.as_deref()) {
                     return Err("APPROVAL_JOURNAL_SCOPE_MISMATCH".into());
                 }
                 if fingerprint(&frame)? != digest {
@@ -184,12 +189,13 @@ impl Inbox {
             Event::Review { version: 1, at, request_id, digest, choice } => {
                 let entry = self.entries.get_mut(&request_id)
                     .ok_or("APPROVAL_JOURNAL_UNKNOWN_REVIEW")?;
-                if (entry.status != Status::Pending && !(choice=="consume" && entry.status==Status::ApprovedForReview)) || entry.digest != digest {
+                if (entry.status != Status::Pending && !(matches!(choice.as_str(),"consume"|"cancel") && entry.status==Status::ApprovedForReview)) || entry.digest != digest {
                     return Err("APPROVAL_JOURNAL_REVIEW_MISMATCH".into());
                 }
                 entry.status = match choice.as_str() {
                     "approve" => Status::ApprovedForReview,
                     "deny" => Status::Denied,
+                    "cancel" => Status::Revoked,
                     "consume" => {
                         entry.granted_at = Some(at);
                         Status::Consumed
@@ -228,9 +234,23 @@ impl Inbox {
             .map_err(|e| format!("APPROVAL_JOURNAL_SYNC: {e}"))
     }
 
+    pub fn workspace_matches(&self,frame:&Value,workspace:&str)->bool{
+        frame["request_id"].as_str().and_then(|id|self.entries.get(id))
+            .is_some_and(|entry|entry.frame==*frame && entry.scope.as_deref()==Some(workspace))
+    }
+    pub fn cancel(&mut self,frame:&Value)->Result<(),String>{
+        let Some(id)=frame["request_id"].as_str()else{return Err("APPROVAL_ID_REQUIRED".into());};
+        let Some(entry)=self.entries.get(id)else{return Ok(());};
+        if entry.frame!=*frame{return Err("APPROVAL_REQUEST_MISMATCH".into());}
+        if !matches!(entry.status,Status::Pending|Status::ApprovedForReview){return Ok(());}
+        let digest=entry.digest.clone();
+        self.append(&Event::Review{version:1,at:epoch_seconds()?,request_id:id.to_owned(),digest,choice:"cancel".into()})?;
+        self.entries.get_mut(id).unwrap().status=Status::Revoked;
+        Ok(())
+    }
     pub fn stage(&mut self, frame: &Value, scope: Option<&str>) -> Result<Value, String> {
         route::deny(frame, &self.host_id)?;
-        if (frame["tool"] == "request_permission") != scope.is_some_and(|path| !path.is_empty()) {
+        if !valid_scope(frame,scope) {
             return Err("APPROVAL_SCOPE_MISMATCH".into());
         }
         let scope = scope.map(str::to_owned);
@@ -265,6 +285,7 @@ impl Inbox {
                 "request_hash":item.digest,
                 "target_host_id":item.frame["target_host_id"],
                 "workspace_id":item.frame["workspace_id"],
+                "workspace_path":if item.frame["tool"].as_str().is_some_and(route::repository_tool){item.scope.as_deref()}else{None},
                 "tool":item.frame["tool"],
                 "arguments":item.frame.get("arguments").cloned().unwrap_or(json!({})),
                 "expires_in_seconds":TTL_SECONDS.saturating_sub(now - item.created).min(item.frame["expires_at"].as_u64().map(|e|e.saturating_sub(now)).unwrap_or(TTL_SECONDS)),

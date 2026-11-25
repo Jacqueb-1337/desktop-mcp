@@ -45,6 +45,8 @@ struct Policy {
     system_request:Option<Value>,
     system_command:Option<(Value, uuid::Uuid)>,
     system_mode:bool,
+    #[cfg(windows)]
+    repository_relay:Option<crate::user_command::RepositoryRelay>,
     started: Option<Instant>,
     until: Option<Instant>,
     persistent: bool,
@@ -65,6 +67,8 @@ impl Default for Policy {
             system_request:None,
             system_command:None,
             system_mode:false,
+            #[cfg(windows)]
+            repository_relay:None,
             started: None,
             until: None,
             persistent: false,
@@ -73,6 +77,26 @@ impl Default for Policy {
 }
 
 impl Policy {
+    #[cfg(windows)]
+    fn relay_repository(&mut self,dir:&Path,method:&str,frame:&Value,host:&str)->Value{
+        if !crate::route::owner_repository_route(frame) || crate::route::deny(frame,host).is_err(){
+            return json!({"error":"OWNER_REPOSITORY_ROUTE_DENIED"});
+        }
+        if self.repository_relay.is_none(){
+            match crate::user_command::RepositoryRelay::start(dir){
+                Ok(relay)=>self.repository_relay=Some(relay),
+                Err(error)=>return json!({"error":error})
+            }
+        }
+        match self.repository_relay.as_mut().unwrap().call(method,frame,host){
+            Ok(reply)=>reply,
+            Err(error)=>{self.repository_relay=None;json!({"error":error})}
+        }
+    }
+    #[cfg(not(windows))]
+    fn relay_repository(&mut self,_dir:&Path,_method:&str,_frame:&Value,_host:&str)->Value{
+        json!({"error":"OWNER_REPOSITORY_AGENT_OFFLINE"})
+    }
     fn privileged_enabled(&self, tool: &str) -> bool {
         match tool {
             elevation::TOOL => self.admin_enabled,
@@ -221,6 +245,7 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
             "identity":pairing.identity(),
             "writes_enabled_at_launch":writes_enabled,
             "remote_patch_engine_enabled":agent.remote_patch_enabled(),
+            "repository_relay_ready":!policy.system_mode && policy.require_pairing_consent && remote_capable,
             "policy":policy.status(),
             "admin_command_granted":policy.remote_reads_enabled && policy.admin_commands_enabled
                 && ( (policy.system_mode && unattended::active(dir,
@@ -255,7 +280,10 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
         "set_remote_readonly" => {
             let Some(enabled)=value["enabled"].as_bool() else {return json!({"error":"BOOLEAN_REQUIRED"});};
             if enabled && !remote_capable {return json!({"error":"REMOTE_READONLY_NOT_ENABLED_AT_LAUNCH"});}
-            if !enabled {policy.remote_reads_enabled=false;policy.search_worker.clear();policy.admin_run=None;policy.terminals.close_all();}
+            if !enabled {
+                policy.remote_reads_enabled=false;policy.search_worker.clear();policy.admin_run=None;policy.terminals.close_all();
+                #[cfg(windows)] {policy.repository_relay=None;}
+            }
             if let Err(error)=persist_remote_gate(dir,enabled){return json!({"error":error});}
             if !enabled {
                 policy.system_runs.clear();
@@ -292,6 +320,9 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 route["arguments"]["capability"].as_str().unwrap_or("")
             } else { tool };
             if policy.system_mode {
+                if crate::route::owner_repository_route(route) {
+                    return policy.relay_repository(dir,"approval_stage",route,host);
+                }
                 if route["version"]!=2 || !policy.admin_commands_enabled {
                     return json!({"error":"LOCAL_PERMISSION_REQUIRED"});
                 }
@@ -325,6 +356,11 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                 };
             }
             if matches!(tool,"admin_command_result"|crate::user_command::TOOL|crate::user_command::RESULT|crate::user_command::ELEVATED|crate::user_command::ELEVATED_RESULT) || (tool=="request_permission" && matches!(capability,crate::user_command::TOOL|crate::user_command::ELEVATED)) || crate::terminal::is_tool(tool) {return json!({"error":"LOCAL_PERMISSION_REQUIRED"});}
+            // Detached launch always requires the owner-local approval workflow;
+            // no auto mode, SYSTEM or existing command grant can authorize it.
+            if capability==crate::detached::TOOL && (!cfg!(windows) || !policy.require_pairing_consent) {
+                return json!({"error":"DETACHED_OWNER_APPROVAL_REQUIRED"});
+            }
             if elevation::is_privileged(capability) && !policy.privileged_enabled(capability) {
                 return json!({"error":"ADMIN_HELPER_UNAVAILABLE"});
             }
@@ -351,13 +387,22 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                         item["tool"].as_str().is_some_and(|name|inbox.has_permission(name,path)))) {
                     return json!({"error":"BATCH_SUBTOOL_PERMISSION_REQUIRED"});
                 }
-                None
+                if route["version"]==2 && crate::route::repository_tool(tool){
+                    Some(agent.root().to_str().unwrap_or(""))
+                }else{None}
             };
             inbox.stage(route, scope).unwrap_or_else(|error|json!({"error":error}))
         },
         "approval_list" => {let mut list=inbox.list();list["workspace_path"]=json!(agent.root().display().to_string());list},
         "approval_cancel" => {
             let frame=&value["route"];
+            if policy.system_mode && crate::route::owner_repository_route(frame) {
+                let host=pairing.identity()["host_id"].as_str().unwrap_or("").to_owned();
+                if policy.remote_reads_enabled {
+                    return policy.relay_repository(dir,"approval_cancel",frame,&host);
+                }
+                return json!({"canceled":true});
+            }
             if policy.system_request.as_ref()==Some(frame) {
                 policy.system_request=None;
                 unattended::clear_request(dir);
@@ -371,7 +416,10 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
             if policy.admin_run.as_ref().is_some_and(|run| run.matches(&value["route"])) {
                 policy.admin_run = None;
             }
-            json!({"canceled":true})
+            match inbox.cancel(frame){
+                Ok(())=>json!({"canceled":true}),
+                Err(error)=>json!({"error":error}),
+            }
         },
         "approval_execute" => {
             let frame=value.get("route").unwrap_or(&Value::Null);
@@ -381,6 +429,11 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
             let host_id=pairing.identity()["host_id"].as_str().unwrap_or("").to_string();
             if policy.system_mode {
                 let rejected=|error|json!({"pending":false,"executed":false,"error":error});
+                if crate::route::owner_repository_route(frame){
+                    let reply=policy.relay_repository(dir,"approval_execute",frame,&host_id);
+                    if reply["pending"].is_boolean() {return reply;}
+                    return rejected(reply["error"].as_str().unwrap_or("OWNER_REPOSITORY_RESPONSE_LOST").to_owned());
+                }
                 if policy.system_request.as_ref()==Some(frame) {
                     let Some(approved)=unattended::owner_decision(dir,frame) else {
                         return json!({"pending":true});
@@ -447,6 +500,14 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     Err(error)=>rejected(error),
                 };
             }
+            if tool==crate::detached::TOOL && (!cfg!(windows) || !policy.require_pairing_consent ||
+                !inbox.has_permission("pairing",path) || !inbox.has_permission(tool,path)) {
+                return json!({"pending":false,"executed":false,"error":"DETACHED_OWNER_APPROVAL_REQUIRED"});
+            }
+            if crate::route::repository_tool(tool) &&
+                !inbox.workspace_matches(frame,agent.root().to_str().unwrap_or("")){
+                return json!({"pending":false,"executed":false,"error":"APPROVAL_WORKSPACE_CHANGED_OR_UNBOUND"});
+            }
             if (policy.require_pairing_consent || elevation::is_privileged(tool)) && tool != "request_permission"
                 && !(inbox.has_permission("pairing", path) && inbox.has_permission(tool, path))
             {
@@ -480,6 +541,12 @@ fn run_request(agent: &mut Agent, pairing: &mut Pairing, policy: &mut Policy, in
                     "pending":false,"executed":true,
                     "data":{"capability":frame["arguments"]["capability"],"duration":frame["arguments"]["duration"],"granted":true}
                 }),
+                Ok(true) if tool == crate::detached::TOOL => {
+                    match crate::detached::spawn(frame) {
+                        Ok(data)=>json!({"pending":false,"executed":true,"data":data}),
+                        Err(error)=>json!({"pending":false,"executed":true,"error":error}),
+                    }
+                },
                 Ok(true) if tool == "git_snapshot" || matches!(tool,"patch_prepare"|"patch_review"|"patch_apply"|"patch_status"|"git_commit_patch") => {
                     let mut args=frame["arguments"].clone();
                     args["host_id"]=json!("local");

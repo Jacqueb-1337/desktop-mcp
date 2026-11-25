@@ -63,3 +63,15 @@ by request ID for up to 24 hours under the same active grant.
 ## Repository development tools
 
 On an explicitly configured repository-capable agent, the host policy can allow fs_read, fs_search, fs_list, git_diff, git_status, fs_batch, and the reviewed patch tools. Keep the existing paired fallback policy unchanged; configure only the capabilities the owner intends to grant. fs_batch also requires every constituent tool in the host policy and, when local capability grants are required, each constituent local grant. The batch still requires exact request approval. See agent/README.md for request shapes and limitations. The Windows protected SYSTEM command service is not automatically granted repository access by these additions.
+
+
+For a Windows installation with the protected service, the repository tools
+use the same machine identity and gateway connection but execute through
+the owner-local agent. The explicit host policy must allow request_permission
+and the desired repository tools; it must also retain any existing command
+capabilities the owner intentionally enabled. Do not replace an existing
+policy with a broad wildcard or start the obsolete duplicate gateway link.
+The owner must approve pairing and individual repository capabilities in the
+tray. No command grant is implicitly converted into repository authorization.
+
+Detached Windows tasks: process_spawn_detached accepts command (PowerShell, max 2000 bytes) and optional absolute working_directory (defaults to the owner's profile). A distinct host policy capability, user-local pairing permission, capability permission and exact per-launch owner approval are required. No administrator or command grant implies this permission. Windows Task Scheduler starts a visible on-demand task with the owner's interactive non-elevated token, unlimited execution time, no automatic trigger or restart. It consumes no MCP terminal slot and continues after terminal/agent/gateway shutdown or MCP permission revocation. Stop and delete it via Windows Task Scheduler; no output is retained by MCP and no sign-out/reboot survival is promised. Returned task path, instance ID and scheduler engine PID identify the Windows task. If a launch result is ambiguous, inspect Task Scheduler before retrying; each approved request ID is one-use. Test with gateway/smoke_detached.py on a disposable fixture.

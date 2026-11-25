@@ -85,7 +85,7 @@ mod platform {
         }
         Ok(linked)
     }
-    fn launch(owner:&str,port:u16,nonce:&str,elevated:bool,terminal:bool)->Result<(Handle,Handle),String>{
+    fn launch(owner:&str,port:u16,nonce:&str,elevated:bool,mode:&str)->Result<(Handle,Handle),String>{
         let token=owner_token(owner,elevated)?;
         let mut profile=vec![0u16;32768];let mut size=profile.len() as u32;
         if unsafe{GetUserProfileDirectoryW(token.0,profile.as_mut_ptr(),&mut size)}==0 {
@@ -97,7 +97,7 @@ mod platform {
         let exe=std::env::current_exe().map_err(|_|"WORKER_BINARY_UNAVAILABLE")?;
         let exe_w=wide(exe.as_os_str());
         let mut line:Vec<u16>="\"".encode_utf16().chain(exe.as_os_str().encode_wide())
-            .chain(format!("\" {} {port} {nonce}",if terminal {"--user-terminal-worker"}else{"--user-command-worker"}).encode_utf16()).chain(Some(0)).collect();
+            .chain(format!("\" {} {port} {nonce}",mode).encode_utf16()).chain(Some(0)).collect();
         let mut info=STARTUPINFOW::default();info.cb=std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut pi=PROCESS_INFORMATION::default();
         let job=Handle(unsafe{CreateJobObjectW(null(),null())});
@@ -146,7 +146,7 @@ mod platform {
         listener.set_nonblocking(true).map_err(|_|"WORKER_BIND_FAILED")?;
         let nonce=format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
         let port=listener.local_addr().map_err(|_|"WORKER_BIND_FAILED")?.port();
-        let (process,_job)=launch(owner,port,&nonce,elevated,false)?;
+        let (process,_job)=launch(owner,port,&nonce,elevated,"--user-command-worker")?;
         let deadline=Instant::now()+Duration::from_secs(8);
         let mut stream=loop {
             if !active(){return Err("COMMAND_CANCELED_OR_EXPIRED".into());}
@@ -175,6 +175,102 @@ mod platform {
             Ok(result)
         }else{Err("WORKER_RESPONSE_INVALID".into())}
     }
+    /// Non-elevated IPC relay to the already installed owner-local agent.
+    /// The owner-local agent remains the authority for all permission checks,
+    /// exact approvals, workspace state, patch proposals and search caches.
+    pub struct RepositoryRelay {
+        _process:Handle,
+        _job:Handle,
+        stream:TcpStream,
+        session:u32,
+        owner:String,
+    }
+    impl std::fmt::Debug for RepositoryRelay {
+        fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+            f.debug_struct("RepositoryRelay").field("session",&self.session).finish_non_exhaustive()
+        }
+    }
+    impl RepositoryRelay {
+        pub fn start(state:&Path)->Result<Self,String>{
+            crate::unattended::verify_machine_identity_path(state)?;
+            let cfg:Value=serde_json::from_slice(&std::fs::read(state.parent().ok_or("MACHINE_STATE_MISSING")?.join("gateway.json"))
+                .map_err(|_|"OWNER_CONFIGURATION_MISSING")?).map_err(|_|"OWNER_CONFIGURATION_INVALID")?;
+            let owner=cfg["ownerSid"].as_str().ok_or("OWNER_CONFIGURATION_INVALID")?.to_owned();
+            let session=unsafe{WTSGetActiveConsoleSessionId()};
+            let listener=TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST,0)).map_err(|_|"WORKER_BIND_FAILED")?;
+            listener.set_nonblocking(true).map_err(|_|"WORKER_BIND_FAILED")?;
+            let nonce=format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
+            let port=listener.local_addr().map_err(|_|"WORKER_BIND_FAILED")?.port();
+            let (process,job)=launch(&owner,port,&nonce,false,"--user-repository-worker")?;
+            let deadline=Instant::now()+Duration::from_secs(3);
+            let mut stream=loop {
+                if Instant::now()>=deadline || unsafe{WaitForSingleObject(process.0,0)}==WAIT_OBJECT_0 {
+                    return Err("OWNER_REPOSITORY_AGENT_OFFLINE".into());
+                }
+                match listener.accept(){
+                    Ok((s,addr)) if addr.ip().is_loopback()=>break s,
+                    Ok(_)=>continue,
+                    Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>thread::sleep(Duration::from_millis(10)),
+                    Err(_)=>return Err("WORKER_ACCEPT_FAILED".into())
+                }
+            };
+            stream.set_nonblocking(false).map_err(|_|"WORKER_IO")?;
+            stream.set_nodelay(true).map_err(|_|"WORKER_IO")?;
+            let handshake=read_line(&mut stream,128,&||Instant::now()<deadline)?;
+            if handshake!=format!("{nonce}\n").as_bytes(){return Err("OWNER_WORKER_AUTH_FAILED".into());}
+            stream.set_write_timeout(Some(Duration::from_secs(1))).map_err(|_|"WORKER_IO")?;
+            Ok(Self{_process:process,_job:job,stream,session,owner})
+        }
+        pub fn call(&mut self,method:&str,frame:&Value,host:&str)->Result<Value,String>{
+            if self.session!=unsafe{WTSGetActiveConsoleSessionId()} || owner_token(&self.owner,false).is_err(){
+                return Err("OWNER_SESSION_UNAVAILABLE".into());
+            }
+            if !valid_repository_relay_request(method,frame,host){return Err("OWNER_REPOSITORY_ROUTE_DENIED".into());}
+            let mut bytes=serde_json::to_vec(&json!({"method":method,"route":frame,"host":host})).map_err(|_|"WORKER_REQUEST_INVALID")?;
+            if bytes.len()>60*1024{return Err("WORKER_REQUEST_INVALID".into());}
+            bytes.push(b'\n');
+            self.stream.write_all(&bytes).map_err(|_|"OWNER_REPOSITORY_RESPONSE_LOST".to_string())?;
+            let deadline=Instant::now()+Duration::from_secs(6);
+            let raw=read_line(&mut self.stream,64*1024,&||Instant::now()<deadline)
+                .map_err(|_|"OWNER_REPOSITORY_RESPONSE_LOST")?;
+            let reply:Value=serde_json::from_slice(&raw).map_err(|_|"WORKER_RESPONSE_INVALID")?;
+            if reply["route_id"]!=frame["request_id"] || reply["method"]!=method ||
+                reply.as_object().is_none_or(|o|o.len()!=3) || !reply["reply"].is_object(){
+                return Err("WORKER_RESPONSE_INVALID".into());
+            }
+            Ok(reply["reply"].clone())
+        }
+    }
+    pub fn repository_worker(port:u16,nonce:&str)->Result<(),String>{
+        if nonce.len()!=64 || !nonce.bytes().all(|b|b.is_ascii_hexdigit()){return Err("WORKER_AUTH_INVALID".into());}
+        let state=std::path::PathBuf::from(std::env::var_os("APPDATA").ok_or("OWNER_PROFILE_UNAVAILABLE")?)
+            .join("com.jacqueb.desktopmcp");
+        // No machine-state paths, secrets, or caller-selected user directories.
+        let mut stream=TcpStream::connect_timeout(&SocketAddrV4::new(Ipv4Addr::LOCALHOST,port).into(),Duration::from_secs(3))
+            .map_err(|_|"WORKER_CONNECT_FAILED")?;
+        stream.set_nodelay(true).map_err(|_|"WORKER_IO")?;
+        stream.set_write_timeout(Some(Duration::from_secs(3))).map_err(|_|"WORKER_IO")?;
+        stream.write_all(format!("{nonce}\n").as_bytes()).map_err(|_|"WORKER_IO")?;
+        let mut input=BufReader::new(stream.try_clone().map_err(|_|"WORKER_IO")?);
+        loop {
+            let mut raw=Vec::new();
+            if input.by_ref().take(60*1024+2).read_until(b'\n',&mut raw).map_err(|_|"WORKER_IO")?==0 {return Ok(());}
+            if raw.len()>60*1024+1||raw.last()!=Some(&b'\n'){return Err("WORKER_REQUEST_INVALID".into());}
+            let request:Value=serde_json::from_slice(&raw).map_err(|_|"WORKER_REQUEST_INVALID")?;
+            let method=request["method"].as_str().ok_or("WORKER_REQUEST_INVALID")?;
+            let host=request["host"].as_str().ok_or("WORKER_REQUEST_INVALID")?;
+            let frame=&request["route"];
+            if request.as_object().is_none_or(|o|o.len()!=3)||!valid_repository_relay_request(method,frame,host){
+                return Err("OWNER_REPOSITORY_ROUTE_DENIED".into());
+            }
+            let reply=forward_repository_request(&state,method,frame,host);
+            let mut encoded=serde_json::to_vec(&json!({"route_id":frame["request_id"],"method":method,"reply":reply}))
+                .map_err(|_|"WORKER_RESPONSE_INVALID")?;
+            if encoded.len()>64*1024-1{return Err("WORKER_OUTPUT_TOO_LARGE".into());}
+            encoded.push(b'\n');
+            stream.write_all(&encoded).map_err(|_|"WORKER_IO")?;
+        }
+    }
     pub struct TerminalShell {
         pub process:OwnedHandle,
         pub job:OwnedHandle,
@@ -194,7 +290,7 @@ mod platform {
         listener.set_nonblocking(true).map_err(|_|"WORKER_BIND_FAILED")?;
         let nonce=format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
         let port=listener.local_addr().map_err(|_|"WORKER_BIND_FAILED")?.port();
-        let (process,job)=launch(owner,port,&nonce,elevated,true)?;
+        let (process,job)=launch(owner,port,&nonce,elevated,"--user-terminal-worker")?;
         let deadline=Instant::now()+Duration::from_secs(6);
         let mut main=None;let mut error=None;
         while main.is_none() || error.is_none() {
@@ -282,4 +378,27 @@ mod platform {
         response.push(b'\n');stream.write_all(&response).map_err(|_|"WORKER_IO".to_string())
     }
 }
-#[cfg(windows)]pub use platform::{run,worker,terminal_shell,terminal_worker};
+#[cfg(windows)]pub use platform::{run,worker,terminal_shell,terminal_worker,RepositoryRelay,repository_worker};
+
+#[cfg(any(windows,test))]
+fn valid_repository_relay_request(method:&str,frame:&Value,host:&str)->bool{
+    matches!(method,"approval_stage"|"approval_execute"|"approval_cancel")
+        && host.len()==32 && host.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))
+        && crate::route::owner_repository_route(frame) && crate::route::deny(frame,host).is_ok()
+}
+#[cfg(any(windows,test))]
+fn forward_repository_request(state:&std::path::Path,method:&str,frame:&Value,host:&str)->Value{
+    let reject=|error:&str|json!({"error":error});
+    if !valid_repository_relay_request(method,frame,host){return reject("OWNER_REPOSITORY_ROUTE_DENIED");}
+    // Check readiness on every request, including after local agent restarts.
+    let status=match crate::service::request(state,"status",json!({})){
+        Ok(value)=>value,Err(_)=>return reject("OWNER_REPOSITORY_AGENT_OFFLINE")
+    };
+    if status["repository_relay_ready"]!=true || status["identity"]["host_id"]!=host{
+        return reject("OWNER_REPOSITORY_AGENT_NOT_AUTHORIZED");
+    }
+    match crate::service::request(state,method,json!({"route":frame})){
+        Ok(reply)=>reply,
+        Err(error)=>reject(&error),
+    }
+}

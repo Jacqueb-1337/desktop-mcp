@@ -87,3 +87,32 @@ Reviewed transfers: in patch_prepare, use operation copy/move/rename, path as ne
 Remote fs_batch: query is an array of 1?4 {tool,arguments} items (fs_read, fs_list, fs_search, git_diff, git_status). For list/search/diff the inner arguments are the query itself. All subtools must be permitted as well as fs_batch, and one exact batch approval is required. The isolated worker runs independent reads concurrently, reports results in input order with per-item errors, and caps aggregate output. Batch search uses a fresh index, not the resident search cache. No commands, writes or nested batches.
 
 Windows SMB repositories: run the repository agent in the authorized signed-in user context (not LocalSystem). If Git reports dubious ownership, the owner must explicitly trust the exact repository in their user Git configuration; do not use a wildcard. Isolated workers retain profile location hints so libgit2 sees that trust configuration. Directory listing has a UNC-only SMB compatibility path, with canonical-path and capability checks retained. The integration fixture can be run on a mapped share using DMCP_SMOKE_REPO_PARENT; it uses disposable Git configuration and repository data.
+
+
+## Windows owner-context repository relay
+
+When the protected Windows service owns the machine's gateway connection, it
+forwards only repository routes (and their capability permission requests) to
+the existing signed-in owner's local agent. The protected service launches a
+non-elevated worker using the installation owner's active console token and
+a bounded authenticated loopback protocol. The worker discovers the local
+agent in the owner's application-data directory; it does not read or forward
+the protected service's private state or credentials. The user-local agent
+must report the same host identity, normal-user mode, and pairing-consent
+enforcement. The owner still approves pairing, each capability, and each exact
+repository operation through the tray. The selected repository is bound to
+the approval journal entry; changing it invalidates a pending operation for
+the previous repository. Cancellation revokes unspent approvals.
+
+The machine gateway connection remains the only gateway connection; do not
+start a second gateway connection using the copied machine identity. Repository
+operations need an explicitly allowed gateway host policy and the owner-local
+agent running while the installation owner is signed in. The machine command
+grants do not authorize repository tools. Revoke repository access using the
+user tray's remote-access revoke action. A lost response during a write is
+ambiguous: inspect the repository before retrying. The native SMB test can
+be run with DMCP_SMOKE_REPO_PARENT pointing to the mapped project directory
+and python gateway/smoke_owner_repository.py <agent.exe>. This exercises the
+actual worker protocol, not the protected service's Windows token launcher.
+
+Detached Windows tasks: process_spawn_detached accepts command (PowerShell, max 2000 bytes) and optional absolute working_directory (defaults to the owner's profile). A distinct host policy capability, user-local pairing permission, capability permission and exact per-launch owner approval are required. No administrator or command grant implies this permission. Windows Task Scheduler starts a visible on-demand task with the owner's interactive non-elevated token, unlimited execution time, no automatic trigger or restart. It consumes no MCP terminal slot and continues after terminal/agent/gateway shutdown or MCP permission revocation. Stop and delete it via Windows Task Scheduler; no output is retained by MCP and no sign-out/reboot survival is promised. Returned task path, instance ID and scheduler engine PID identify the Windows task. If a launch result is ambiguous, inspect Task Scheduler before retrying; each approved request ID is one-use. Test with gateway/smoke_detached.py on a disposable fixture.

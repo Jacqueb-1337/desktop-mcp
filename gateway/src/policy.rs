@@ -151,6 +151,12 @@ pub fn valid_duration(duration: &str) -> bool {
     })
 }
 
+pub fn valid_detached_args(args:&Value)->bool{
+    args.as_object().is_some_and(|o|o.len()==1+usize::from(o.contains_key("working_directory"))
+        && args["command"].as_str().is_some_and(valid_command)
+        && o.get("working_directory").is_none_or(|v|v.as_str().is_some_and(|s|
+            !s.is_empty() && s.len()<=500 && !s.chars().any(char::is_control))))
+}
 pub fn valid_command(command: &str) -> bool {
     !command.trim().is_empty() && command.len() <= 2000 && command.chars().all(|ch| {
         (matches!(ch, '\n' | '\t') || !ch.is_control())
@@ -166,13 +172,13 @@ impl PolicyFile {
             if host.host_id.len()!=32||!host.host_id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err("INVALID_POLICY_HOST_ID".into())
             }
-            if host.workspace_id!="default"||host.tools.len()>18 {
+            if host.workspace_id!="default"||host.tools.len()>19 {
                 return Err("INVALID_POLICY_WORKSPACE_OR_TOOLS".into())
             }
             if !unique.insert((host.host_id.as_str(),host.workspace_id.as_str())) {
                 return Err("DUPLICATE_POLICY_SCOPE".into())
             }
-            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"fs_search"|"fs_list"|"fs_batch"|"git_diff"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command")) {
+            if host.tools.iter().any(|tool|!matches!(tool.as_str(),"git_status"|"fs_read"|"fs_search"|"fs_list"|"fs_batch"|"git_diff"|"use_repository"|"git_snapshot"|"patch_prepare"|"patch_review"|"patch_status"|"patch_apply"|"git_commit_patch"|"request_permission"|"system_volume_status"|"admin_command"|"user_command"|"elevated_user_command"|"process_spawn_detached")) {
                 return Err("UNSAFE_POLICY_TOOL".into())
             }
             if host.tools.iter().collect::<HashSet<_>>().len()!=host.tools.len() {

@@ -55,18 +55,18 @@ async function refreshApprovals() {
       const title = document.createElement("strong");
       const permission = item.tool === "request_permission";
       if (permission) {
-        const labels = { pairing: "Pair this PC", git_status: "Allow Git status", fs_read: "Allow project file reads", fs_search: "Allow project file search", fs_list: "Allow directory browsing", git_diff: "Allow Git diff inspection", fs_batch: "Allow batched read operations", system_volume_status: "Allow Windows system volume checks", admin_command: "Allow requests for elevated PowerShell commands" };
+        const labels = { process_spawn_detached: "Allow independently managed Windows task launch requests (each launch needs approval)", pairing: "Pair this PC", git_status: "Allow Git status", fs_read: "Allow project file reads", fs_search: "Allow project file search", fs_list: "Allow directory browsing", git_diff: "Allow Git diff inspection", fs_batch: "Allow batched read operations", system_volume_status: "Allow Windows system volume checks", admin_command: "Allow requests for elevated PowerShell commands" };
         const durations = { "30m": "30 minutes", "1h": "1 hour", "4h": "4 hours", permanent: "until revoked" };
         const requested = item.arguments.duration;
         const duration = durations[requested] || (requested.endsWith("m") ? requested.slice(0, -1) + " minutes" : requested);
-        title.textContent = labels[item.arguments.capability] + " · " + duration;
+        title.textContent = (labels[item.arguments.capability] || ("Allow " + String(item.arguments.capability))) + " · " + duration;
       } else {
         const labels = { fs_read: "File read request", fs_search: "Project search request", fs_list: "Directory browsing request", git_diff: "Git diff request", fs_batch: "Batched read request", git_status: "Git status request",
           system_volume_status: "Windows system volume check (requires UAC)", admin_command: "Elevated PowerShell command" };
-        title.textContent = labels[item.tool] || "Tool request";
+        title.textContent = item.tool === "process_spawn_detached" ? "Launch independent Windows task (survives MCP shutdown/revoke)" : labels[item.tool] || "Tool request";
       }
       const info = document.createElement("small");
-      info.textContent = "Project " + String(result.workspace_path || item.workspace_id || "") +
+      info.textContent = (item.tool === "process_spawn_detached" ? "Windows owns this task, including after MCP shutdown or access revocation. Stop or delete it in Task Scheduler. No automatic triggers or elevation. | " : "") + "Project " + String(item.workspace_path || result.workspace_path || item.workspace_id || "") +
         (item.tool === "admin_command" ? "" : " | " + JSON.stringify(item.arguments || {})) +
         " | Host " + String(item.target_host_id || "").slice(0, 16) +
         " | ID " + String(item.request_id || "").slice(0, 8) +

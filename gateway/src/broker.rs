@@ -222,7 +222,7 @@ impl Broker {
             workspace_id: "default".into(),
             tool: tool.into(),
         };
-        if !matches!(tool, "git_status" | "fs_read" | "fs_search" | "fs_list" | "fs_batch" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result" | "elevated_user_command" | "elevated_user_command_result") && !terminal_tool(tool)
+        if !matches!(tool, "git_status" | "fs_read" | "fs_search" | "fs_list" | "fs_batch" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "request_permission" | "system_volume_status" | "admin_command" | "admin_command_result" | "user_command" | "user_command_result" | "elevated_user_command" | "elevated_user_command_result" | "process_spawn_detached") && !terminal_tool(tool)
             || self.policy_decision(&intent, host) != Decision::RequiresLocalApproval
         {
             return Err("POLICY_DENIED".into());
@@ -237,7 +237,7 @@ impl Broker {
         }
         if tool == "request_permission" {
             let capability = args["capability"].as_str().ok_or("CAPABILITY_REQUIRED")?;
-            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "fs_search" | "fs_list" | "fs_batch" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command" | "elevated_user_command")
+            if !matches!(capability, "pairing" | "git_status" | "fs_read" | "fs_search" | "fs_list" | "fs_batch" | "git_diff" | "use_repository" | "git_snapshot" | "patch_prepare" | "patch_review" | "patch_status" | "patch_apply" | "git_commit_patch" | "system_volume_status" | "admin_command" | "user_command" | "elevated_user_command" | "process_spawn_detached")
                 || !args["duration"].as_str().is_some_and(crate::policy::valid_duration)
             {
                 return Err("INVALID_PERMISSION_REQUEST".into());
@@ -279,6 +279,12 @@ impl Broker {
             "patch_prepare" => json!({"expected_head":args["expected_head"],"changes":args["changes"]}),
             "patch_review"|"patch_status"|"patch_apply" => json!({"patch_id":args["patch_id"]}),
             "git_commit_patch" => json!({"patch_id":args["patch_id"],"message":args["message"]}),
+            "process_spawn_detached" => {
+                let mut payload=json!({"command":args["command"]});
+                if let Some(value)=args.get("working_directory"){payload["working_directory"]=value.clone();}
+                if !crate::policy::valid_detached_args(&payload){return Err("INVALID_DETACHED_ARGUMENTS".into());}
+                payload
+            },
             "admin_command"|"user_command"|"elevated_user_command" => json!({"command":args["command"]}),
             "admin_command_result"|"user_command_result"|"elevated_user_command_result" => json!({"run_id":args["run_id"]}),
             tool if terminal_tool(tool) => {

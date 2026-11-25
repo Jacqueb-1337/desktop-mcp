@@ -95,3 +95,7 @@ create mode-0700 directories; production audit checks remain unchanged.
 - Each permission can be temporary or permanent until revoked. The existing elevated Windows service remains responsible for enforcing them. Owner-session execution requires the owner to be signed in; a machine with no owner session fails closed.
 - User-session shells use the owner's Windows profile and available network credentials. Windows may expose different SMB drive mappings to elevated and non-elevated tokens. If a drive is not present, use its UNC path when accessible, or establish a mapping with the owner's approval. No credentials are copied or automatically changed.
 - The terminal limit remains four per PC. Up to four one-shot routes can be in flight independently, and terminal output pages contain up to 16 KiB.
+
+## Detached launches (0.3.5)
+
+The process_spawn_detached capability permits explicitly approved on-demand Windows tasks as the signed-in normal user. Tasks are intentionally unmanaged by Desktop MCP, have no automatic triggers and do not stop on MCP access revocation. The owner must approve the exact launch; an existing command grant is insufficient. The result includes the task path and instance ID. Stop and remove the task in Windows Task Scheduler. Commands may access connected user drives. No automatic sign-out/reboot persistence, elevated launch, captured output, or MCP job control is provided.

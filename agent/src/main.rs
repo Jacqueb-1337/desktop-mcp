@@ -13,6 +13,7 @@ mod unattended;
 mod user_command;
 mod terminal;
 mod approval;
+mod detached;
 
 use core::Agent;
 use serde_json::{json, Value};
@@ -83,10 +84,10 @@ fn process(request:&Value, agent:&mut Agent) -> Option<Value> {
 fn main() {
     let raw:Vec<_>=env::args_os().skip(1).collect();
     #[cfg(windows)]
-    if raw.first().is_some_and(|v|v=="--user-command-worker" || v=="--user-terminal-worker") {
+    if raw.first().is_some_and(|v|v=="--user-command-worker" || v=="--user-terminal-worker" || v=="--user-repository-worker") {
         if raw.len()!=3 {std::process::exit(2);}
         let result=raw[1].to_str().and_then(|s|s.parse::<u16>().ok()).zip(raw[2].to_str())
-            .ok_or("INVALID_WORKER_ARGUMENTS".to_string()).and_then(|(port,nonce)|if raw[0]=="--user-terminal-worker" {user_command::terminal_worker(port,nonce)}else{user_command::worker(port,nonce)});
+            .ok_or("INVALID_WORKER_ARGUMENTS".to_string()).and_then(|(port,nonce)|if raw[0]=="--user-terminal-worker" {user_command::terminal_worker(port,nonce)}else if raw[0]=="--user-repository-worker" {user_command::repository_worker(port,nonce)}else{user_command::worker(port,nonce)});
         std::process::exit(if result.is_ok(){0}else{1});
     }
     if raw.first().is_some_and(|v|v=="--readonly-search-session") {
