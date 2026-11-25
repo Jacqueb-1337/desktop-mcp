@@ -1,3 +1,4 @@
+mod async_commands;
 mod policy;
 mod control;
 mod route;
@@ -631,7 +632,7 @@ fn run() -> Result<(), String> {
         let state=audit_dir.as_ref().ok_or("MCP_AUDIT_REQUIRED")?;
         let audit=audit::Audit::open(state)?;
         let broker=Arc::new(broker::Broker::new(policy,audit,state)?);let dispatch=broker.clone();
-        mcp::start(address,(*tls).clone(),cfg,Arc::new(move|tool,args,alive|dispatch.call(tool,args,alive)))?;
+        mcp::start(address,(*tls).clone(),cfg,async_commands::wrap(Arc::new(move|tool,args,alive|dispatch.call(tool,args,alive))))?;
         Some(broker)
     } else {if mcp_token.is_some() || mcp_authority.is_some() {return Err("MCP_LISTEN_REQUIRED".into());}None};
     let address=listener.local_addr().map_err(|e|e.to_string())?;
